@@ -64,7 +64,7 @@ pub use read::{CommentPrefix, CsvEncoding, CsvReader, NullValues};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 pub use write::{BatchedWriter, CsvWriter, QuoteStyle};
-pub use write_impl::SerializeOptions;
+pub use write_impl::{SciNotationOptions, SerializeOptions};
 
 use crate::csv::read_impl::CoreReader;
 use crate::mmap::MmapBytesReader;

@@ -682,6 +682,7 @@ impl PyLazyFrame {
             null: null_value,
             line_terminator,
             quote_style,
+            ..Default::default()
         };
 
         let options = CsvWriterOptions {
