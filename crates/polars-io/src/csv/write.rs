@@ -135,6 +135,14 @@ where
         self
     }
 
+    /// Set the CSV file's float scientific format.
+    pub fn with_float_scientific(mut self, precision: Option<SciNotationOptions>) -> Self {
+        if precision.is_some() {
+            self.options.float_scientific = precision;
+        }
+        self
+    }
+
     /// Set the single byte character used for quoting.
     pub fn with_quote_char(mut self, char: u8) -> Self {
         self.options.quote_char = char;

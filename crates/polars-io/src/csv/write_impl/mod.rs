@@ -18,7 +18,7 @@ use self::serializer::{serializer_for, string_serializer};
 use super::write::QuoteStyle;
 use super::*;
 
-/// Options to write scietific notation.
+/// Options to write scientific notation.
 ///
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
