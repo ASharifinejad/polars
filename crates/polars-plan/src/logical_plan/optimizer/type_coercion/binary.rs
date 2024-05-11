@@ -19,7 +19,7 @@ fn compares_cat_to_string(type_left: &DataType, type_right: &DataType, op: Opera
             && matches_any_order!(
                 type_left,
                 type_right,
-                DataType::String,
+                DataType::String | DataType::Unknown(UnknownKind::Str),
                 DataType::Categorical(_, _) | DataType::Enum(_, _)
             )
     }
@@ -211,7 +211,39 @@ pub(super) fn process_binary(
         unpack!(get_aexpr_and_type(expr_arena, node_left, &input_schema));
     let (right, type_right): (&AExpr, DataType) =
         unpack!(get_aexpr_and_type(expr_arena, node_right, &input_schema));
-    unpack!(early_escape(&type_left, &type_right));
+
+    match (&type_left, &type_right) {
+        (Unknown(UnknownKind::Any), Unknown(UnknownKind::Any)) => return Ok(None),
+        (
+            Unknown(UnknownKind::Any),
+            Unknown(UnknownKind::Int(_) | UnknownKind::Float | UnknownKind::Str),
+        ) => {
+            let right = unpack!(materialize(right));
+            let right = expr_arena.add(right);
+
+            return Ok(Some(AExpr::BinaryExpr {
+                left: node_left,
+                op,
+                right,
+            }));
+        },
+        (
+            Unknown(UnknownKind::Int(_) | UnknownKind::Float | UnknownKind::Str),
+            Unknown(UnknownKind::Any),
+        ) => {
+            let left = unpack!(materialize(left));
+            let left = expr_arena.add(left);
+
+            return Ok(Some(AExpr::BinaryExpr {
+                left,
+                op,
+                right: node_right,
+            }));
+        },
+        _ => {
+            unpack!(early_escape(&type_left, &type_right));
+        },
+    }
 
     use DataType::*;
     // don't coerce string with number comparisons. They must error
@@ -223,25 +255,37 @@ pub(super) fn process_binary(
             return Ok(None)
         },
         #[cfg(feature = "dtype-categorical")]
-        (String | Categorical(_, _), dt, op) | (dt, String | Categorical(_, _), op)
+        (String | Unknown(UnknownKind::Str) | Categorical(_, _), dt, op)
+        | (dt, Unknown(UnknownKind::Str) | String | Categorical(_, _), op)
             if op.is_comparison() && dt.is_numeric() =>
         {
             return Ok(None)
         },
         #[cfg(feature = "dtype-categorical")]
-        (String | Enum(_, _), dt, op) | (dt, String | Enum(_, _), op)
+        (Unknown(UnknownKind::Str) | String | Enum(_, _), dt, op)
+        | (dt, Unknown(UnknownKind::Str) | String | Enum(_, _), op)
             if op.is_comparison() && dt.is_numeric() =>
         {
             return Ok(None)
         },
         #[cfg(feature = "dtype-date")]
-        (Date, String, op) | (String, Date, op) if op.is_comparison() => err_date_str_compare()?,
+        (Date, String | Unknown(UnknownKind::Str), op)
+        | (String | Unknown(UnknownKind::Str), Date, op)
+            if op.is_comparison() =>
+        {
+            err_date_str_compare()?
+        },
         #[cfg(feature = "dtype-datetime")]
-        (Datetime(_, _), String, op) | (String, Datetime(_, _), op) if op.is_comparison() => {
+        (Datetime(_, _), String | Unknown(UnknownKind::Str), op)
+        | (String | Unknown(UnknownKind::Str), Datetime(_, _), op)
+            if op.is_comparison() =>
+        {
             err_date_str_compare()?
         },
         #[cfg(feature = "dtype-time")]
-        (Time, String, op) if op.is_comparison() => err_date_str_compare()?,
+        (Time | Unknown(UnknownKind::Str), String, op) if op.is_comparison() => {
+            err_date_str_compare()?
+        },
         // structs can be arbitrarily nested, leave the complexity to the caller for now.
         #[cfg(feature = "dtype-struct")]
         (Struct(_), Struct(_), _op) => return Ok(None),
@@ -271,14 +315,10 @@ pub(super) fn process_binary(
     }
 
     // All early return paths
-    if compare_cat_to_string
-        || datetime_arithmetic
-        || early_escape(&type_left, &type_right).is_none()
-    {
+    if compare_cat_to_string || datetime_arithmetic {
         Ok(None)
     } else {
         // Coerce types:
-
         let st = unpack!(get_supertype(&type_left, &type_right));
         let mut st = modify_supertype(st, left, right, &type_left, &type_right);
 

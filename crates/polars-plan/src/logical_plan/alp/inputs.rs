@@ -150,14 +150,9 @@ impl IR {
                 input: inputs.pop().unwrap(),
                 payload: payload.clone(),
             },
-            SimpleProjection {
-                columns,
-                duplicate_check,
-                ..
-            } => SimpleProjection {
+            SimpleProjection { columns, .. } => SimpleProjection {
                 input: inputs.pop().unwrap(),
                 columns: columns.clone(),
-                duplicate_check: *duplicate_check,
             },
             Invalid => unreachable!(),
         }
@@ -265,17 +260,18 @@ impl IR {
         container.push_node(input)
     }
 
-    pub fn get_inputs(&self) -> Vec<Node> {
-        let mut inputs = Vec::new();
+    pub fn get_inputs(&self) -> UnitVec<Node> {
+        let mut inputs: UnitVec<Node> = unitvec!();
         self.copy_inputs(&mut inputs);
         inputs
     }
-    /// panics if more than one input
-    #[cfg(any(
-        all(feature = "strings", feature = "concat_str"),
-        feature = "streaming",
-        feature = "fused"
-    ))]
+
+    pub fn get_inputs_vec(&self) -> Vec<Node> {
+        let mut inputs = vec![];
+        self.copy_inputs(&mut inputs);
+        inputs
+    }
+
     pub(crate) fn get_input(&self) -> Option<Node> {
         let mut inputs: UnitVec<Node> = unitvec!();
         self.copy_inputs(&mut inputs);

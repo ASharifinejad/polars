@@ -76,7 +76,7 @@ from polars.datatypes import (
     Object,
     String,
     Time,
-    UInt8,
+    UInt16,
     UInt32,
     UInt64,
     Unknown,
@@ -94,6 +94,7 @@ from polars.dependencies import (
     _check_for_pandas,
     _check_for_pyarrow,
     hvplot,
+    import_optional,
 )
 from polars.dependencies import numpy as np
 from polars.dependencies import pandas as pd
@@ -116,6 +117,7 @@ with contextlib.suppress(ImportError):  # Module not available when building doc
 if TYPE_CHECKING:
     import sys
 
+    import torch
     from hvplot.plotting.core import hvPlotTabularPolars
 
     from polars import DataFrame, DataType, Expr
@@ -131,6 +133,7 @@ if TYPE_CHECKING:
         InterpolationMethod,
         IntoExpr,
         IntoExprColumn,
+        NonNestedLiteral,
         NullBehavior,
         NumericLiteral,
         OneOrMoreDataTypes,
@@ -325,27 +328,31 @@ class Series:
             )
             if values.dtype.type in [np.datetime64, np.timedelta64]:
                 # cast to appropriate dtype, handling NaT values
+                input_dtype = _resolve_temporal_dtype(None, values.dtype)
                 dtype = _resolve_temporal_dtype(dtype, values.dtype)
                 if dtype is not None:
                     self._s = (
-                        self.cast(dtype)
+                        # `values.dtype` has already been validated in
+                        # `numpy_to_pyseries`, so `input_dtype` can't be `None`
+                        self.cast(input_dtype)  # type: ignore[arg-type]
+                        .cast(dtype)
                         .scatter(np.argwhere(np.isnat(values)).flatten(), None)
                         ._s
                     )
                     return
 
             if dtype is not None:
-                self._s = self.cast(dtype, strict=True)._s
+                self._s = self.cast(dtype, strict=strict)._s
 
         elif _check_for_pyarrow(values) and isinstance(
             values, (pa.Array, pa.ChunkedArray)
         ):
-            self._s = arrow_to_pyseries(name, values)
+            self._s = arrow_to_pyseries(name, values, dtype=dtype, strict=strict)
 
         elif _check_for_pandas(values) and isinstance(
             values, (pd.Series, pd.Index, pd.DatetimeIndex)
         ):
-            self._s = pandas_to_pyseries(name, values)
+            self._s = pandas_to_pyseries(name, values, dtype=dtype, strict=strict)
 
         elif _is_generator(values):
             self._s = iterable_to_pyseries(name, values, dtype=dtype, strict=strict)
@@ -544,10 +551,11 @@ class Series:
         """
         Get flags that are set on the Series.
 
-        Returns
-        -------
-        dict
-            Dictionary containing the flag name and the value
+        Examples
+        --------
+        >>> s = pl.Series("a", [1, 2, 3])
+        >>> s.flags
+        {'SORTED_ASC': False, 'SORTED_DESC': False}
         """
         out = {
             "SORTED_ASC": self._s.is_sorted_ascending_flag(),
@@ -2893,7 +2901,7 @@ class Series:
 
         Concatenate Series with rechunk = True
 
-        >>> pl.concat([s, s2]).chunk_lengths()
+        >>> pl.concat([s, s2], rechunk=True).chunk_lengths()
         [6]
 
         Concatenate Series with rechunk = False
@@ -2916,7 +2924,7 @@ class Series:
 
         Concatenate Series with rechunk = True
 
-        >>> pl.concat([s, s2]).n_chunks()
+        >>> pl.concat([s, s2], rechunk=True).n_chunks()
         1
 
         Concatenate Series with rechunk = False
@@ -3397,7 +3405,7 @@ class Series:
 
         This has time complexity:
 
-        .. math:: O(n + k \\log{}n - \frac{k}{2})
+        .. math:: O(n + k \log{n} - \frac{k}{2})
 
         Parameters
         ----------
@@ -3427,7 +3435,7 @@ class Series:
 
         This has time complexity:
 
-        .. math:: O(n + k \\log{}n - \frac{k}{2})
+        .. math:: O(n + k \log{n} - \frac{k}{2})
 
         Parameters
         ----------
@@ -3537,19 +3545,19 @@ class Series:
 
     @overload
     def search_sorted(
-        self, element: int | float, side: SearchSortedSide = ...
+        self, element: NonNestedLiteral, side: SearchSortedSide = ...
     ) -> int: ...
 
     @overload
     def search_sorted(
         self,
-        element: Series | np.ndarray[Any, Any] | list[int] | list[float],
+        element: list[NonNestedLiteral] | np.ndarray[Any, Any] | Expr | Series,
         side: SearchSortedSide = ...,
     ) -> Series: ...
 
     def search_sorted(
         self,
-        element: int | float | Series | np.ndarray[Any, Any] | list[int] | list[float],
+        element: IntoExpr | np.ndarray[Any, Any],
         side: SearchSortedSide = "any",
     ) -> int | Series:
         """
@@ -3600,10 +3608,11 @@ class Series:
                 6
         ]
         """
-        if isinstance(element, (int, float)):
-            return F.select(F.lit(self).search_sorted(element, side)).item()
-        element = Series(element)
-        return F.select(F.lit(self).search_sorted(element, side)).to_series()
+        df = F.select(F.lit(self).search_sorted(element, side))
+        if isinstance(element, (list, Series, pl.Expr, np.ndarray)):
+            return df.to_series()
+        else:
+            return df.item()
 
     def unique(self, *, maintain_order: bool = False) -> Series:
         """
@@ -4367,17 +4376,6 @@ class Series:
                 msg = "cannot return a zero-copy array"
                 raise ValueError(msg)
 
-        def temporal_dtype_to_numpy(dtype: PolarsDataType) -> Any:
-            if dtype == Date:
-                return np.dtype("datetime64[D]")
-            elif dtype == Duration:
-                return np.dtype(f"timedelta64[{dtype.time_unit}]")  # type: ignore[union-attr]
-            elif dtype == Datetime:
-                return np.dtype(f"datetime64[{dtype.time_unit}]")  # type: ignore[union-attr]
-            else:
-                msg = f"invalid temporal type: {dtype}"
-                raise TypeError(msg)
-
         if self.n_chunks() > 1:
             raise_on_copy()
             self = self.rechunk()
@@ -4402,38 +4400,36 @@ class Series:
                 zero_copy_only=not allow_copy, writable=writable
             )
 
-        if self.null_count() == 0:
-            if dtype.is_integer() or dtype.is_float():
-                np_array = self._s.to_numpy_view()
-            elif dtype == Boolean:
-                raise_on_copy()
-                s_u8 = self.cast(UInt8)
-                np_array = s_u8._s.to_numpy_view().view(bool)
-            elif dtype in (Datetime, Duration):
-                np_dtype = temporal_dtype_to_numpy(dtype)
-                s_i64 = self.to_physical()
-                np_array = s_i64._s.to_numpy_view().view(np_dtype)
-            elif dtype == Date:
-                raise_on_copy()
-                np_dtype = temporal_dtype_to_numpy(dtype)
-                s_i32 = self.to_physical()
-                np_array = s_i32._s.to_numpy_view().astype(np_dtype)
-            else:
-                raise_on_copy()
-                np_array = self._s.to_numpy()
+        return self._s.to_numpy(allow_copy=allow_copy, writable=writable)
 
+    def to_torch(self) -> torch.Tensor:
+        """
+        Convert this Series to a PyTorch tensor.
+
+        Examples
+        --------
+        >>> s = pl.Series("x", [1, 0, 1, 2, 0], dtype=pl.UInt8)
+        >>> s.to_torch()
+        tensor([1, 0, 1, 2, 0], dtype=torch.uint8)
+        """
+        torch = import_optional("torch")
+
+        # PyTorch tensors do not support uint16/32/64
+        if self.dtype in (UInt32, UInt64):
+            srs = self.cast(Int64)
+        elif self.dtype == UInt16:
+            srs = self.cast(Int32)
         else:
-            raise_on_copy()
-            np_array = self._s.to_numpy()
-            if dtype in (Datetime, Duration, Date):
-                np_dtype = temporal_dtype_to_numpy(dtype)
-                np_array = np_array.view(np_dtype)
+            srs = self
 
-        if writable and not np_array.flags.writeable:
-            raise_on_copy()
-            np_array = np_array.copy()
+        # we have to build the tensor from a writable array or PyTorch will complain
+        # about it (as writing to readonly array results in undefined behavior)
+        numpy_array = srs.to_numpy(writable=True, use_pyarrow=False)
+        tensor = torch.from_numpy(numpy_array)
 
-        return np_array
+        # note: named tensors are currently experimental
+        # tensor.rename(self.name)
+        return tensor
 
     def to_arrow(self) -> pa.Array:
         """
@@ -4805,6 +4801,15 @@ class Series:
         value
             Value used to fill NaN values.
 
+        Warnings
+        --------
+        Note that floating point NaNs (Not a Number) are not missing values.
+        To replace missing values, use :func:`fill_null`.
+
+        See Also
+        --------
+        fill_null
+
         Examples
         --------
         >>> s = pl.Series("a", [1, 2, 3, float("nan")])
@@ -4821,7 +4826,7 @@ class Series:
 
     def fill_null(
         self,
-        value: Any | None = None,
+        value: Any | Expr | None = None,
         strategy: FillNullStrategy | None = None,
         limit: int | None = None,
     ) -> Series:
@@ -4837,6 +4842,10 @@ class Series:
         limit
             Number of consecutive null values to fill when using the 'forward' or
             'backward' strategy.
+
+        See Also
+        --------
+        fill_nan
 
         Examples
         --------
@@ -5263,6 +5272,12 @@ class Series:
         .. warning::
             This method is much slower than the native expressions API.
             Only use it if you cannot implement your logic otherwise.
+
+            Suppose that the function is: `x ↦ sqrt(x)`:
+
+            - For mapping elements of a series, consider: `s.sqrt()`.
+            - For mapping inner elements of lists, consider:
+              `s.list.eval(pl.element().sqrt())`.
 
         If the function returns a different datatype, the return_dtype arg should
         be set, otherwise the method will fail.
@@ -6878,6 +6893,92 @@ class Series:
                 1.0
                 1.666667
                 2.428571
+        ]
+        """
+
+    def ewm_mean_by(
+        self,
+        by: str | IntoExpr,
+        *,
+        half_life: str | timedelta,
+    ) -> Series:
+        r"""
+        Calculate time-based exponentially weighted moving average.
+
+        Given observations :math:`x_1, x_2, \ldots, x_n` at times
+        :math:`t_1, t_2, \ldots, t_n`, the EWMA is calculated as
+
+            .. math::
+
+                y_0 &= x_0
+
+                \alpha_i &= \exp(-\lambda(t_i - t_{i-1}))
+
+                y_i &= \alpha_i x_i + (1 - \alpha_i) y_{i-1}; \quad i > 0
+
+        where :math:`\lambda` equals :math:`\ln(2) / \text{half_life}`.
+
+        Parameters
+        ----------
+        by
+            Times to calculate average by. Should be ``DateTime``, ``Date``, ``UInt64``,
+            ``UInt32``, ``Int64``, or ``Int32`` data type.
+        half_life
+            Unit over which observation decays to half its value.
+
+            Can be created either from a timedelta, or
+            by using the following string language:
+
+            - 1ns   (1 nanosecond)
+            - 1us   (1 microsecond)
+            - 1ms   (1 millisecond)
+            - 1s    (1 second)
+            - 1m    (1 minute)
+            - 1h    (1 hour)
+            - 1d    (1 day)
+            - 1w    (1 week)
+            - 1i    (1 index count)
+
+            Or combine them:
+            "3d12h4m25s" # 3 days, 12 hours, 4 minutes, and 25 seconds
+
+            Note that `half_life` is treated as a constant duration - calendar
+            durations such as months (or even days in the time-zone-aware case)
+            are not supported, please express your duration in an approximately
+            equivalent number of hours (e.g. '370h' instead of '1mo').
+        check_sorted
+            Check whether `by` column is sorted.
+            Incorrectly setting this to `False` will lead to incorrect output.
+
+        Returns
+        -------
+        Expr
+            Float32 if input is Float32, otherwise Float64.
+
+        Examples
+        --------
+        >>> from datetime import date, timedelta
+        >>> df = pl.DataFrame(
+        ...     {
+        ...         "values": [0, 1, 2, None, 4],
+        ...         "times": [
+        ...             date(2020, 1, 1),
+        ...             date(2020, 1, 3),
+        ...             date(2020, 1, 10),
+        ...             date(2020, 1, 15),
+        ...             date(2020, 1, 17),
+        ...         ],
+        ...     }
+        ... ).sort("times")
+        >>> df["values"].ewm_mean_by(df["times"], half_life="4d")
+        shape: (5,)
+        Series: 'values' [f64]
+        [
+                0.0
+                0.292893
+                1.492474
+                null
+                3.254508
         ]
         """
 

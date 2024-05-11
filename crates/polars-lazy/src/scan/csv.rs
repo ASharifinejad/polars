@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use polars_core::prelude::*;
-use polars_io::csv::utils::infer_file_schema;
-use polars_io::csv::{CommentPrefix, CsvEncoding, NullValues};
+use polars_io::csv::read::{infer_file_schema, CommentPrefix, CsvEncoding, NullValues};
 use polars_io::utils::get_reader_bytes;
 use polars_io::RowIndex;
 
@@ -10,36 +9,39 @@ use crate::prelude::*;
 
 #[derive(Clone)]
 #[cfg(feature = "csv")]
-pub struct LazyCsvReader<'a> {
+pub struct LazyCsvReader {
+    // TODO: Use CsvReadOptions here.
     path: PathBuf,
     paths: Arc<[PathBuf]>,
     separator: u8,
-    has_header: bool,
-    ignore_errors: bool,
     skip_rows: usize,
     n_rows: Option<usize>,
-    cache: bool,
     schema: Option<SchemaRef>,
-    schema_overwrite: Option<&'a Schema>,
-    low_memory: bool,
+    schema_overwrite: Option<SchemaRef>,
     comment_prefix: Option<CommentPrefix>,
     quote_char: Option<u8>,
     eol_char: u8,
     null_values: Option<NullValues>,
-    missing_is_null: bool,
-    truncate_ragged_lines: bool,
     infer_schema_length: Option<usize>,
     rechunk: bool,
     skip_rows_after_header: usize,
     encoding: CsvEncoding,
     row_index: Option<RowIndex>,
+    n_threads: Option<usize>,
+    cache: bool,
+    has_header: bool,
+    ignore_errors: bool,
+    low_memory: bool,
+    missing_is_null: bool,
+    truncate_ragged_lines: bool,
+    decimal_comma: bool,
     try_parse_dates: bool,
     raise_if_empty: bool,
-    n_threads: Option<usize>,
+    glob: bool,
 }
 
 #[cfg(feature = "csv")]
-impl<'a> LazyCsvReader<'a> {
+impl LazyCsvReader {
     pub fn new_paths(paths: Arc<[PathBuf]>) -> Self {
         Self::new("").with_paths(paths)
     }
@@ -71,6 +73,8 @@ impl<'a> LazyCsvReader<'a> {
             raise_if_empty: true,
             truncate_ragged_lines: false,
             n_threads: None,
+            decimal_comma: false,
+            glob: true,
         }
     }
 
@@ -129,14 +133,14 @@ impl<'a> LazyCsvReader<'a> {
     /// Overwrite the schema with the dtypes in this given Schema. The given schema may be a subset
     /// of the total schema.
     #[must_use]
-    pub fn with_dtype_overwrite(mut self, schema: Option<&'a Schema>) -> Self {
+    pub fn with_dtype_overwrite(mut self, schema: Option<SchemaRef>) -> Self {
         self.schema_overwrite = schema;
         self
     }
 
     /// Set whether the CSV file has headers
     #[must_use]
-    pub fn has_header(mut self, has_header: bool) -> Self {
+    pub fn with_has_header(mut self, has_header: bool) -> Self {
         self.has_header = has_header;
         self
     }
@@ -155,7 +159,7 @@ impl<'a> LazyCsvReader<'a> {
             if s.len() == 1 && s.chars().next().unwrap().is_ascii() {
                 CommentPrefix::Single(s.as_bytes()[0])
             } else {
-                CommentPrefix::Multi(s.to_string())
+                CommentPrefix::Multi(Arc::from(s))
             }
         });
         self
@@ -170,7 +174,7 @@ impl<'a> LazyCsvReader<'a> {
 
     /// Set the `char` used as end of line. The default is `b'\n'`.
     #[must_use]
-    pub fn with_end_of_line_char(mut self, eol_char: u8) -> Self {
+    pub fn with_eol_char(mut self, eol_char: u8) -> Self {
         self.eol_char = eol_char;
         self
     }
@@ -197,7 +201,7 @@ impl<'a> LazyCsvReader<'a> {
 
     /// Reduce memory usage at the expense of performance
     #[must_use]
-    pub fn low_memory(mut self, toggle: bool) -> Self {
+    pub fn with_low_memory(mut self, toggle: bool) -> Self {
         self.low_memory = toggle;
         self
     }
@@ -219,15 +223,28 @@ impl<'a> LazyCsvReader<'a> {
 
     /// Raise an error if CSV is empty (otherwise return an empty frame)
     #[must_use]
-    pub fn raise_if_empty(mut self, toggle: bool) -> Self {
+    pub fn with_raise_if_empty(mut self, toggle: bool) -> Self {
         self.raise_if_empty = toggle;
         self
     }
 
     /// Truncate lines that are longer than the schema.
     #[must_use]
-    pub fn truncate_ragged_lines(mut self, toggle: bool) -> Self {
+    pub fn with_truncate_ragged_lines(mut self, toggle: bool) -> Self {
         self.truncate_ragged_lines = toggle;
+        self
+    }
+
+    #[must_use]
+    pub fn with_decimal_comma(mut self, toggle: bool) -> Self {
+        self.decimal_comma = toggle;
+        self
+    }
+
+    #[must_use]
+    /// Expand path given via globbing rules.
+    pub fn with_glob(mut self, toggle: bool) -> Self {
+        self.glob = toggle;
         self
     }
 
@@ -266,11 +283,12 @@ impl<'a> LazyCsvReader<'a> {
             self.try_parse_dates,
             self.raise_if_empty,
             &mut self.n_threads,
+            self.decimal_comma,
         )?;
         let mut schema = f(schema)?;
 
         // the dtypes set may be for the new names, so update again
-        if let Some(overwrite_schema) = self.schema_overwrite {
+        if let Some(overwrite_schema) = &self.schema_overwrite {
             for (name, dtype) in overwrite_schema.iter() {
                 schema.with_column(name.clone(), dtype.clone());
             }
@@ -280,9 +298,9 @@ impl<'a> LazyCsvReader<'a> {
     }
 }
 
-impl LazyFileListReader for LazyCsvReader<'_> {
+impl LazyFileListReader for LazyCsvReader {
     fn finish_no_glob(self) -> PolarsResult<LazyFrame> {
-        let mut lf: LazyFrame = LogicalPlanBuilder::scan_csv(
+        let mut lf: LazyFrame = DslBuilder::scan_csv(
             self.path,
             self.separator,
             self.has_header,
@@ -306,11 +324,16 @@ impl LazyFileListReader for LazyCsvReader<'_> {
             self.raise_if_empty,
             self.truncate_ragged_lines,
             self.n_threads,
+            self.decimal_comma,
         )?
         .build()
         .into();
         lf.opt_state.file_caching = true;
         Ok(lf)
+    }
+
+    fn glob(&self) -> bool {
+        self.glob
     }
 
     fn path(&self) -> &Path {
@@ -365,6 +388,13 @@ impl LazyFileListReader for LazyCsvReader<'_> {
 
     fn concat_impl(&self, lfs: Vec<LazyFrame>) -> PolarsResult<LazyFrame> {
         // set to false, as the csv parser has full thread utilization
-        concat_impl(&lfs, self.rechunk(), false, true, false)
+        let args = UnionArgs {
+            rechunk: self.rechunk(),
+            parallel: false,
+            to_supertypes: false,
+            from_partitioned_ds: true,
+            ..Default::default()
+        };
+        concat_impl(&lfs, args)
     }
 }

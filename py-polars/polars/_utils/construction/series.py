@@ -22,6 +22,7 @@ from polars._utils.construction.utils import (
     get_first_non_none,
     is_namedtuple,
     is_pydantic_model,
+    is_simple_numpy_backed_pandas_series,
 )
 from polars._utils.various import (
     find_stacklevel,
@@ -31,6 +32,7 @@ from polars._utils.wrap import wrap_s
 from polars.datatypes import (
     INTEGER_DTYPES,
     TEMPORAL_DTYPES,
+    Array,
     Boolean,
     Categorical,
     Date,
@@ -56,6 +58,7 @@ from polars.datatypes.constructor import (
     py_type_to_constructor,
 )
 from polars.dependencies import (
+    _PYARROW_AVAILABLE,
     _check_for_numpy,
     dataclasses,
 )
@@ -94,7 +97,7 @@ def sequence_to_pyseries(
         dtype = Null
 
     # lists defer to subsequent handling; identify nested type
-    elif dtype == List:
+    elif dtype in (List, Array):
         python_dtype = list
 
     # infer temporal type handling
@@ -128,8 +131,9 @@ def sequence_to_pyseries(
     # flat data
     if (
         dtype is not None
-        and dtype not in (List, Struct, Unknown)
         and is_polars_dtype(dtype)
+        and not dtype.is_nested()
+        and dtype != Unknown
         and (python_dtype is None)
     ):
         constructor = polars_type_to_constructor(dtype)
@@ -158,159 +162,153 @@ def sequence_to_pyseries(
             schema=struct_schema,
             orient="row",
         ).to_struct(name)
-    else:
-        if python_dtype is None:
-            if value is None:
-                constructor = polars_type_to_constructor(Null)
-                return constructor(name, values, strict)
 
-            # generic default dtype
-            python_dtype = type(value)
+    if python_dtype is None:
+        if value is None:
+            constructor = polars_type_to_constructor(Null)
+            return constructor(name, values, strict)
 
-        # temporal branch
-        if python_dtype in py_temporal_types:
-            if dtype is None:
-                dtype = py_type_to_dtype(python_dtype)  # construct from integer
-            elif dtype in py_temporal_types:
-                dtype = py_type_to_dtype(dtype)
+        # generic default dtype
+        python_dtype = type(value)
 
-            values_dtype = (
-                None
-                if value is None
-                else py_type_to_dtype(type(value), raise_unmatched=False)
-            )
-            if values_dtype is not None and values_dtype.is_float():
-                msg = f"'float' object cannot be interpreted as a {python_dtype.__name__!r}"
-                raise TypeError(
-                    # we do not accept float values as temporal; if this is
-                    # required, the caller should explicitly cast to int first.
-                    msg
-                )
+    # temporal branch
+    if python_dtype in py_temporal_types:
+        if dtype is None:
+            dtype = py_type_to_dtype(python_dtype)  # construct from integer
+        elif dtype in py_temporal_types:
+            dtype = py_type_to_dtype(dtype)
 
-            # We use the AnyValue builder to create the datetime array
-            # We store the values internally as UTC and set the timezone
-            py_series = PySeries.new_from_any_values(name, values, strict)
-
-            time_unit = getattr(dtype, "time_unit", None)
-            time_zone = getattr(dtype, "time_zone", None)
-
-            if time_unit is None or values_dtype == Date:
-                s = wrap_s(py_series)
-            else:
-                s = wrap_s(py_series).dt.cast_time_unit(time_unit)
-
-            if (values_dtype == Date) & (dtype == Datetime):
-                return (
-                    s.cast(Datetime(time_unit or "us"))
-                    .dt.replace_time_zone(time_zone)
-                    ._s
-                )
-
-            if (dtype == Datetime) and (
-                value.tzinfo is not None or time_zone is not None
-            ):
-                values_tz = str(value.tzinfo) if value.tzinfo is not None else None
-                dtype_tz = dtype.time_zone  # type: ignore[union-attr]
-                if values_tz is not None and (
-                    dtype_tz is not None and dtype_tz != "UTC"
-                ):
-                    msg = (
-                        "time-zone-aware datetimes are converted to UTC"
-                        "\n\nPlease either drop the time zone from the dtype, or set it to 'UTC'."
-                        " To convert to a different time zone, please use `.dt.convert_time_zone`."
-                    )
-                    raise ValueError(msg)
-                if values_tz != "UTC" and dtype_tz is None:
-                    warnings.warn(
-                        "Constructing a Series with time-zone-aware "
-                        "datetimes results in a Series with UTC time zone. "
-                        "To silence this warning, you can filter "
-                        "warnings of class TimeZoneAwareConstructorWarning, or "
-                        "set 'UTC' as the time zone of your datatype.",
-                        TimeZoneAwareConstructorWarning,
-                        stacklevel=find_stacklevel(),
-                    )
-                return s.dt.replace_time_zone(dtype_tz or "UTC")._s
-            return s._s
-
-        elif (
-            _check_for_numpy(value)
-            and isinstance(value, np.ndarray)
-            and len(value.shape) == 1
-        ):
-            n_elems = len(value)
-            if all(len(v) == n_elems for v in values):
-                # can take (much) faster path if all lists are the same length
-                return numpy_to_pyseries(
-                    name,
-                    np.vstack(values),
-                    strict=strict,
-                    nan_to_null=nan_to_null,
-                )
-            else:
-                return PySeries.new_series_list(
-                    name,
-                    [
-                        numpy_to_pyseries("", v, strict=strict, nan_to_null=nan_to_null)
-                        for v in values
-                    ],
-                    strict,
-                )
-
-        elif python_dtype in (list, tuple):
-            if dtype is None:
-                return PySeries.new_from_any_values(name, values, strict=strict)
-            elif dtype == Object:
-                return PySeries.new_object(name, values, strict)
-            else:
-                if (inner_dtype := getattr(dtype, "inner", None)) is not None:
-                    pyseries_list = [
-                        None
-                        if value is None
-                        else sequence_to_pyseries(
-                            "",
-                            value,
-                            inner_dtype,
-                            strict=strict,
-                            nan_to_null=nan_to_null,
-                        )
-                        for value in values
-                    ]
-                    pyseries = PySeries.new_series_list(name, pyseries_list, strict)
-                else:
-                    pyseries = PySeries.new_from_any_values_and_dtype(
-                        name, values, dtype, strict=strict
-                    )
-                if dtype != pyseries.dtype():
-                    pyseries = pyseries.cast(dtype, strict=False)
-                return pyseries
-
-        elif python_dtype == pl.Series:
-            return PySeries.new_series_list(
-                name, [v._s if v is not None else None for v in values], strict
+        values_dtype = (
+            None
+            if value is None
+            else py_type_to_dtype(type(value), raise_unmatched=False)
+        )
+        if values_dtype is not None and values_dtype.is_float():
+            msg = f"'float' object cannot be interpreted as a {python_dtype.__name__!r}"
+            raise TypeError(
+                # we do not accept float values as temporal; if this is
+                # required, the caller should explicitly cast to int first.
+                msg
             )
 
-        elif python_dtype == PySeries:
-            return PySeries.new_series_list(name, values, strict)
+        # We use the AnyValue builder to create the datetime array
+        # We store the values internally as UTC and set the timezone
+        py_series = PySeries.new_from_any_values(name, values, strict)
+
+        time_unit = getattr(dtype, "time_unit", None)
+        time_zone = getattr(dtype, "time_zone", None)
+
+        if time_unit is None or values_dtype == Date:
+            s = wrap_s(py_series)
         else:
-            constructor = py_type_to_constructor(python_dtype)
-            if constructor == PySeries.new_object:
-                try:
-                    srs = PySeries.new_from_any_values(name, values, strict)
-                    if _check_for_numpy(python_dtype, check_type=False) and isinstance(
-                        np.bool_(True), np.generic
-                    ):
-                        dtype = numpy_char_code_to_dtype(np.dtype(python_dtype).char)
-                        return srs.cast(dtype, strict=strict)
-                    else:
-                        return srs
+            s = wrap_s(py_series).dt.cast_time_unit(time_unit)
 
-                except RuntimeError:
-                    return PySeries.new_from_any_values(name, values, strict=strict)
-
-            return _construct_series_with_fallbacks(
-                constructor, name, values, dtype, strict=strict
+        if (values_dtype == Date) & (dtype == Datetime):
+            return (
+                s.cast(Datetime(time_unit or "us")).dt.replace_time_zone(time_zone)._s
             )
+
+        if (dtype == Datetime) and (value.tzinfo is not None or time_zone is not None):
+            values_tz = str(value.tzinfo) if value.tzinfo is not None else None
+            dtype_tz = dtype.time_zone  # type: ignore[union-attr]
+            if values_tz is not None and (dtype_tz is not None and dtype_tz != "UTC"):
+                msg = (
+                    "time-zone-aware datetimes are converted to UTC"
+                    "\n\nPlease either drop the time zone from the dtype, or set it to 'UTC'."
+                    " To convert to a different time zone, please use `.dt.convert_time_zone`."
+                )
+                raise ValueError(msg)
+            if values_tz != "UTC" and dtype_tz is None:
+                warnings.warn(
+                    "Constructing a Series with time-zone-aware "
+                    "datetimes results in a Series with UTC time zone. "
+                    "To silence this warning, you can filter "
+                    "warnings of class TimeZoneAwareConstructorWarning, or "
+                    "set 'UTC' as the time zone of your datatype.",
+                    TimeZoneAwareConstructorWarning,
+                    stacklevel=find_stacklevel(),
+                )
+            return s.dt.replace_time_zone(dtype_tz or "UTC")._s
+        return s._s
+
+    elif (
+        _check_for_numpy(value)
+        and isinstance(value, np.ndarray)
+        and len(value.shape) == 1
+    ):
+        n_elems = len(value)
+        if all(len(v) == n_elems for v in values):
+            # can take (much) faster path if all lists are the same length
+            return numpy_to_pyseries(
+                name,
+                np.vstack(values),
+                strict=strict,
+                nan_to_null=nan_to_null,
+            )
+        else:
+            return PySeries.new_series_list(
+                name,
+                [
+                    numpy_to_pyseries("", v, strict=strict, nan_to_null=nan_to_null)
+                    for v in values
+                ],
+                strict,
+            )
+
+    elif python_dtype in (list, tuple):
+        if dtype is None:
+            return PySeries.new_from_any_values(name, values, strict=strict)
+        elif dtype == Object:
+            return PySeries.new_object(name, values, strict)
+        else:
+            if (inner_dtype := getattr(dtype, "inner", None)) is not None:
+                pyseries_list = [
+                    None
+                    if value is None
+                    else sequence_to_pyseries(
+                        "",
+                        value,
+                        inner_dtype,
+                        strict=strict,
+                        nan_to_null=nan_to_null,
+                    )
+                    for value in values
+                ]
+                pyseries = PySeries.new_series_list(name, pyseries_list, strict)
+            else:
+                pyseries = PySeries.new_from_any_values_and_dtype(
+                    name, values, dtype, strict=strict
+                )
+            if dtype != pyseries.dtype():
+                pyseries = pyseries.cast(dtype, strict=False)
+            return pyseries
+
+    elif python_dtype == pl.Series:
+        return PySeries.new_series_list(
+            name, [v._s if v is not None else None for v in values], strict
+        )
+
+    elif python_dtype == PySeries:
+        return PySeries.new_series_list(name, values, strict)
+    else:
+        constructor = py_type_to_constructor(python_dtype)
+        if constructor == PySeries.new_object:
+            try:
+                srs = PySeries.new_from_any_values(name, values, strict)
+                if _check_for_numpy(python_dtype, check_type=False) and isinstance(
+                    np.bool_(True), np.generic
+                ):
+                    dtype = numpy_char_code_to_dtype(np.dtype(python_dtype).char)
+                    return srs.cast(dtype, strict=strict)
+                else:
+                    return srs
+
+            except RuntimeError:
+                return PySeries.new_from_any_values(name, values, strict=strict)
+
+        return _construct_series_with_fallbacks(
+            constructor, name, values, dtype, strict=strict
+        )
 
 
 def _construct_series_with_fallbacks(
@@ -402,18 +400,41 @@ def iterable_to_pyseries(
 def pandas_to_pyseries(
     name: str,
     values: pd.Series[Any] | pd.Index[Any] | pd.DatetimeIndex,
+    dtype: PolarsDataType | None = None,
     *,
+    strict: bool = True,
     nan_to_null: bool = True,
 ) -> PySeries:
     """Construct a PySeries from a pandas Series or DatetimeIndex."""
     if not name and values.name is not None:
         name = str(values.name)
+    if is_simple_numpy_backed_pandas_series(values):
+        return pl.Series(
+            name, values.to_numpy(), dtype=dtype, nan_to_null=nan_to_null, strict=strict
+        )._s
+    if not _PYARROW_AVAILABLE:
+        msg = (
+            "pyarrow is required for converting a pandas series to Polars, "
+            "unless it is a simple numpy-backed one "
+            "(e.g. 'int64', 'bool', 'float32' - not 'Int64')"
+        )
+        raise ImportError(msg)
     return arrow_to_pyseries(
-        name, plc.pandas_series_to_arrow(values, nan_to_null=nan_to_null)
+        name,
+        plc.pandas_series_to_arrow(values, nan_to_null=nan_to_null),
+        dtype=dtype,
+        strict=strict,
     )
 
 
-def arrow_to_pyseries(name: str, values: pa.Array, *, rechunk: bool = True) -> PySeries:
+def arrow_to_pyseries(
+    name: str,
+    values: pa.Array,
+    dtype: PolarsDataType | None = None,
+    *,
+    strict: bool = True,
+    rechunk: bool = True,
+) -> PySeries:
     """Construct a PySeries from an Arrow array."""
     array = plc.coerce_arrow(values)
 
@@ -450,7 +471,7 @@ def arrow_to_pyseries(name: str, values: pa.Array, *, rechunk: bool = True) -> P
         if rechunk:
             pys.rechunk(in_place=True)
 
-    return pys
+    return pys.cast(dtype, strict=strict) if dtype is not None else pys
 
 
 def numpy_to_pyseries(

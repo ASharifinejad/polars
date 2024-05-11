@@ -5,7 +5,9 @@ use super::*;
 fn get_upper_projections(
     parent: Node,
     lp_arena: &Arena<IR>,
+    expr_arena: &Arena<AExpr>,
     names_scratch: &mut Vec<ColumnName>,
+    found_required_columns: &mut bool,
 ) -> bool {
     let parent = lp_arena.get(parent);
 
@@ -15,9 +17,15 @@ fn get_upper_projections(
         SimpleProjection { columns, .. } => {
             let iter = columns.iter_names().map(|s| ColumnName::from(s.as_str()));
             names_scratch.extend(iter);
+            *found_required_columns = true;
             false
         },
-        Filter { .. } => true,
+        Filter { predicate, .. } => {
+            // Also add predicate, as the projection is above the filter node.
+            names_scratch.extend(aexpr_to_leaf_names(predicate.node(), expr_arena));
+
+            true
+        },
         // Only filter and projection nodes are allowed, any other node we stop.
         _ => false,
     }
@@ -195,13 +203,17 @@ pub(super) fn set_cache_states(
                     v.parents.push(frame.parent);
                     v.cache_nodes.push(frame.current);
 
-                    let mut found_columns = false;
+                    let mut found_required_columns = false;
 
                     for parent_node in frame.parent.into_iter().flatten() {
-                        let keep_going =
-                            get_upper_projections(parent_node, lp_arena, &mut names_scratch);
+                        let keep_going = get_upper_projections(
+                            parent_node,
+                            lp_arena,
+                            expr_arena,
+                            &mut names_scratch,
+                            &mut found_required_columns,
+                        );
                         if !names_scratch.is_empty() {
-                            found_columns = true;
                             v.names_union.extend(names_scratch.drain(..));
                         }
                         // We stop early as we want to find the first projection node above the cache.
@@ -231,7 +243,7 @@ pub(super) fn set_cache_states(
 
                     // There was no explicit projection and we must take
                     // all columns
-                    if !found_columns {
+                    if !found_required_columns {
                         let schema = lp.schema(lp_arena);
                         v.names_union.extend(
                             schema

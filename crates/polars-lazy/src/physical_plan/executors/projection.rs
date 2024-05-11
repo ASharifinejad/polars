@@ -24,32 +24,13 @@ impl ProjectionExec {
         mut df: DataFrame,
     ) -> PolarsResult<DataFrame> {
         // Vertical and horizontal parallelism.
-        let df =
-            if self.streamable && df.n_chunks() > 1 && df.height() > 0 && self.options.run_parallel
-            {
-                let chunks = df.split_chunks().collect::<Vec<_>>();
-                let iter = chunks.into_par_iter().map(|mut df| {
-                    let selected_cols = evaluate_physical_expressions(
-                        &mut df,
-                        &self.cse_exprs,
-                        &self.expr,
-                        state,
-                        self.has_windows,
-                        self.options.run_parallel,
-                    )?;
-                    check_expand_literals(
-                        selected_cols,
-                        df.height() == 0,
-                        self.options.duplicate_check,
-                    )
-                });
-
-                let df = POOL.install(|| iter.collect::<PolarsResult<Vec<_>>>())?;
-                accumulate_dataframes_vertical_unchecked(df)
-            }
-            // Only horizontal parallelism.
-            else {
-                #[allow(clippy::let_and_return)]
+        let df = if self.streamable
+            && df.n_chunks() > 1
+            && df.height() > POOL.current_num_threads() * 2
+            && self.options.run_parallel
+        {
+            let chunks = df.split_chunks().collect::<Vec<_>>();
+            let iter = chunks.into_par_iter().map(|mut df| {
                 let selected_cols = evaluate_physical_expressions(
                     &mut df,
                     &self.cse_exprs,
@@ -62,8 +43,29 @@ impl ProjectionExec {
                     selected_cols,
                     df.height() == 0,
                     self.options.duplicate_check,
-                )?
-            };
+                )
+            });
+
+            let df = POOL.install(|| iter.collect::<PolarsResult<Vec<_>>>())?;
+            accumulate_dataframes_vertical_unchecked(df)
+        }
+        // Only horizontal parallelism.
+        else {
+            #[allow(clippy::let_and_return)]
+            let selected_cols = evaluate_physical_expressions(
+                &mut df,
+                &self.cse_exprs,
+                &self.expr,
+                state,
+                self.has_windows,
+                self.options.run_parallel,
+            )?;
+            check_expand_literals(
+                selected_cols,
+                df.height() == 0,
+                self.options.duplicate_check,
+            )?
+        };
 
         // this only runs during testing and check if the runtime type matches the predicted schema
         #[cfg(test)]
@@ -86,9 +88,9 @@ impl Executor for ProjectionExec {
         {
             if state.verbose() {
                 if self.cse_exprs.is_empty() {
-                    println!("run ProjectionExec");
+                    eprintln!("run ProjectionExec");
                 } else {
-                    println!("run ProjectionExec with {} CSE", self.cse_exprs.len())
+                    eprintln!("run ProjectionExec with {} CSE", self.cse_exprs.len())
                 };
             }
         }
@@ -106,7 +108,7 @@ impl Executor for ProjectionExec {
                     )
                 })
                 .collect::<PolarsResult<Vec<_>>>()?;
-            let name = comma_delimited("projection".to_string(), &by);
+            let name = comma_delimited("select".to_string(), &by);
             Cow::Owned(name)
         } else {
             Cow::Borrowed("")

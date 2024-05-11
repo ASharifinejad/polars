@@ -348,6 +348,20 @@ def test_sort_maintain_order() -> None:
     assert l1 == l2 == ["A", "B", "C"]
 
 
+@pytest.mark.parametrize("nulls_last", [False, True], ids=["nulls_first", "nulls_last"])
+def test_sort_maintain_order_descending_repeated_nulls(nulls_last: bool) -> None:
+    got = (
+        pl.LazyFrame({"A": [None, -1, 1, 1, None], "B": [1, 2, 3, 4, 5]})
+        .sort("A", descending=True, maintain_order=True, nulls_last=nulls_last)
+        .collect()
+    )
+    if nulls_last:
+        expect = pl.DataFrame({"A": [1, 1, -1, None, None], "B": [3, 4, 2, 1, 5]})
+    else:
+        expect = pl.DataFrame({"A": [None, None, 1, 1, -1], "B": [1, 5, 3, 4, 2]})
+    assert_frame_equal(got, expect)
+
+
 def test_replace() -> None:
     df = pl.DataFrame({"a": [2, 1, 3], "b": [1, 2, 3]})
     s = pl.Series("c", [True, False, True])
@@ -574,10 +588,10 @@ def test_multiple_columns_drop() -> None:
 
 def test_concat() -> None:
     df1 = pl.DataFrame({"a": [2, 1, 3], "b": [1, 2, 3], "c": [1, 2, 3]})
-    df2 = pl.concat([df1, df1])
+    df2 = pl.concat([df1, df1], rechunk=True)
 
     assert df2.shape == (6, 3)
-    assert df2.n_chunks() == 1  # the default is to rechunk
+    assert df2.n_chunks() == 1
     assert df2.rows() == df1.rows() + df1.rows()
     assert pl.concat([df1, df1], rechunk=False).n_chunks() == 2
 
@@ -1055,18 +1069,6 @@ def test_literal_series() -> None:
     )
 
 
-def test_rename(df: pl.DataFrame) -> None:
-    out = df.rename({"strings": "bars", "int": "foos"})
-    # check if we can select these new columns
-    _ = out[["foos", "bars"]]
-
-
-def test_rename_lambda() -> None:
-    df = pl.DataFrame({"a": [1], "b": [2], "c": [3]})
-    out = df.rename(lambda col: "foo" if col == "a" else "bar" if col == "b" else col)
-    assert out.columns == ["foo", "bar", "c"]
-
-
 def test_write_csv() -> None:
     df = pl.DataFrame(
         {
@@ -1244,7 +1246,7 @@ def test_from_large_uint64_misc() -> None:
         df = pl.DataFrame(
             uint_data,
             orient="row",
-            schema_overrides=overrides,  # type: ignore[arg-type]
+            schema_overrides=overrides,
         )
         assert df.schema == OrderedDict(
             [
@@ -1791,93 +1793,6 @@ def test_empty_projection() -> None:
     assert empty_df.shape == (0, 0)
 
 
-def test_with_column_renamed() -> None:
-    df = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
-    result = df.rename({"b": "c"})
-    expected = pl.DataFrame({"a": [1, 2], "c": [3, 4]})
-    assert_frame_equal(result, expected)
-
-
-def test_rename_swap() -> None:
-    df = pl.DataFrame(
-        {
-            "a": [1, 2, 3, 4, 5],
-            "b": [5, 4, 3, 2, 1],
-        }
-    )
-
-    out = df.rename({"a": "b", "b": "a"})
-    expected = pl.DataFrame(
-        {
-            "b": [1, 2, 3, 4, 5],
-            "a": [5, 4, 3, 2, 1],
-        }
-    )
-    assert_frame_equal(out, expected)
-
-    # 6195
-    ldf = pl.DataFrame(
-        {
-            "weekday": [
-                1,
-            ],
-            "priority": [
-                2,
-            ],
-            "roundNumber": [
-                3,
-            ],
-            "flag": [
-                4,
-            ],
-        }
-    ).lazy()
-
-    # Rename some columns (note: swapping two columns)
-    rename_dict = {
-        "weekday": "priority",
-        "priority": "weekday",
-        "roundNumber": "round_number",
-    }
-    ldf = ldf.rename(rename_dict)
-
-    # Select some columns
-    ldf = ldf.select(["priority", "weekday", "round_number"])
-
-    assert ldf.collect().to_dict(as_series=False) == {
-        "priority": [1],
-        "weekday": [2],
-        "round_number": [3],
-    }
-
-
-def test_rename_same_name() -> None:
-    df = pl.DataFrame(
-        {
-            "nrs": [1, 2, 3, 4, 5],
-            "groups": ["A", "A", "B", "C", "B"],
-        }
-    ).lazy()
-    df = df.rename({"groups": "groups"})
-    df = df.select(["groups"])
-    assert df.collect().to_dict(as_series=False) == {
-        "groups": ["A", "A", "B", "C", "B"]
-    }
-    df = pl.DataFrame(
-        {
-            "nrs": [1, 2, 3, 4, 5],
-            "groups": ["A", "A", "B", "C", "B"],
-            "test": [1, 2, 3, 4, 5],
-        }
-    ).lazy()
-    df = df.rename({"nrs": "nrs", "groups": "groups"})
-    df = df.select(["groups"])
-    df.collect()
-    assert df.collect().to_dict(as_series=False) == {
-        "groups": ["A", "A", "B", "C", "B"]
-    }
-
-
 def test_fill_null() -> None:
     df = pl.DataFrame({"a": [1, 2], "b": [3, None]})
     assert_frame_equal(df.fill_null(4), pl.DataFrame({"a": [1, 2], "b": [3, 4]}))
@@ -2233,26 +2148,6 @@ def test_getitem() -> None:
     assert_frame_equal(df[4, [5]], pl.DataFrame({"foo5": [1024]}))
 
 
-@pytest.mark.parametrize(
-    ("as_series", "inner_dtype"), [(True, pl.Series), (False, list)]
-)
-def test_to_dict(as_series: bool, inner_dtype: Any) -> None:
-    df = pl.DataFrame(
-        {
-            "A": [1, 2, 3, 4, 5],
-            "fruits": ["banana", "banana", "apple", "apple", "banana"],
-            "B": [5, 4, 3, 2, 1],
-            "cars": ["beetle", "audi", "beetle", "beetle", "beetle"],
-            "optional": [28, 300, None, 2, -30],
-        }
-    )
-    s = df.to_dict(as_series=as_series)
-    assert isinstance(s, dict)
-    for v in s.values():
-        assert isinstance(v, inner_dtype)
-        assert len(v) == len(df)
-
-
 def test_df_broadcast() -> None:
     df = pl.DataFrame({"a": [1, 2, 3]}, schema_overrides={"a": pl.UInt8})
     out = df.with_columns(pl.Series("s", [[1, 2]]))
@@ -2283,13 +2178,22 @@ def test_product() -> None:
     assert_frame_equal(out, expected, check_dtype=False)
 
 
-def test_first_last_expression(fruits_cars: pl.DataFrame) -> None:
+def test_first_last_nth_expressions(fruits_cars: pl.DataFrame) -> None:
     df = fruits_cars
     out = df.select(pl.first())
     assert out.columns == ["A"]
 
     out = df.select(pl.last())
     assert out.columns == ["cars"]
+
+    out = df.select(pl.nth(0))
+    assert out.columns == ["A"]
+
+    out = df.select(pl.nth(1))
+    assert out.columns == ["fruits"]
+
+    out = df.select(pl.nth(-2))
+    assert out.columns == ["B"]
 
 
 def test_is_between(fruits_cars: pl.DataFrame) -> None:

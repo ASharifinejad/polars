@@ -1,4 +1,5 @@
 //! DataFrame module.
+#[cfg(feature = "zip_with")]
 use std::borrow::Cow;
 use std::{mem, ops};
 
@@ -22,7 +23,7 @@ pub mod row;
 mod top_k;
 mod upstream_traits;
 
-pub use chunks::*;
+use arrow::record_batch::RecordBatch;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use smartstring::alias::String as SmartString;
@@ -429,15 +430,6 @@ impl DataFrame {
         // of both `columns` and `names`
         drop(names);
         Ok(DataFrame { columns })
-    }
-
-    /// Aggregate all chunks to contiguous memory.
-    #[must_use]
-    pub fn agg_chunks(&self) -> Self {
-        // Don't parallelize this. Memory overhead
-        let f = |s: &Series| s.rechunk();
-        let cols = self.columns.iter().map(f).collect();
-        unsafe { DataFrame::new_no_checks(cols) }
     }
 
     /// Shrink the capacity of this DataFrame to fit its length.
@@ -1635,7 +1627,7 @@ impl DataFrame {
         let n_threads = POOL.current_num_threads();
 
         let masks = split_ca(mask, n_threads).unwrap();
-        let dfs = split_df(self, n_threads).unwrap();
+        let dfs = split_df(self, n_threads);
         let dfs: PolarsResult<Vec<_>> = POOL.install(|| {
             masks
                 .par_iter()
@@ -1666,7 +1658,7 @@ impl DataFrame {
     /// ```
     /// # use polars_core::prelude::*;
     /// fn example(df: &DataFrame) -> PolarsResult<DataFrame> {
-    ///     let mask = df.column("sepal.width")?.is_not_null();
+    ///     let mask = df.column("sepal_width")?.is_not_null();
     ///     df.filter(&mask)
     /// }
     /// ```
@@ -1884,8 +1876,8 @@ impl DataFrame {
     /// Sort by a single column with default options:
     /// ```
     /// # use polars_core::prelude::*;
-    /// fn sort_by_a(df: &DataFrame) -> PolarsResult<DataFrame> {
-    ///     df.sort(["a"], Default::default())
+    /// fn sort_by_sepal_width(df: &DataFrame) -> PolarsResult<DataFrame> {
+    ///     df.sort(["sepal_width"], Default::default())
     /// }
     /// ```
     /// Sort by a single column with specific order:
@@ -1893,7 +1885,7 @@ impl DataFrame {
     /// # use polars_core::prelude::*;
     /// fn sort_with_specific_order(df: &DataFrame, descending: bool) -> PolarsResult<DataFrame> {
     ///     df.sort(
-    ///         ["a"],
+    ///         ["sepal_width"],
     ///         SortMultipleOptions::new()
     ///             .with_order_descending(descending)
     ///     )
@@ -1904,7 +1896,7 @@ impl DataFrame {
     /// # use polars_core::prelude::*;
     /// fn sort_by_multiple_columns_with_specific_order(df: &DataFrame) -> PolarsResult<DataFrame> {
     ///     df.sort(
-    ///         &["a", "b"],
+    ///         &["sepal_width", "sepal_length"],
     ///         SortMultipleOptions::new()
     ///             .with_order_descendings([false, true])
     ///     )
@@ -2563,7 +2555,12 @@ impl DataFrame {
     pub fn mean_horizontal(&self, null_strategy: NullStrategy) -> PolarsResult<Option<Series>> {
         match self.columns.len() {
             0 => Ok(None),
-            1 => Ok(Some(self.columns[0].clone())),
+            1 => Ok(Some(match self.columns[0].dtype() {
+                dt if dt != &DataType::Float32 && (dt.is_numeric() || dt == &DataType::Boolean) => {
+                    self.columns[0].cast(&DataType::Float64)?
+                },
+                _ => self.columns[0].clone(),
+            })),
             _ => {
                 let columns = self
                     .columns
@@ -2826,7 +2823,7 @@ impl DataFrame {
         &mut self,
         hasher_builder: Option<ahash::RandomState>,
     ) -> PolarsResult<UInt64Chunked> {
-        let dfs = split_df(self, POOL.current_num_threads())?;
+        let dfs = split_df(self, POOL.current_num_threads());
         let (cas, _) = _df_rows_to_hashes_threaded_vertical(&dfs, hasher_builder)?;
 
         let mut iter = cas.into_iter();
@@ -2996,7 +2993,7 @@ pub struct RecordBatchIter<'a> {
 }
 
 impl<'a> Iterator for RecordBatchIter<'a> {
-    type Item = ArrowChunk;
+    type Item = RecordBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.idx >= self.n_chunks {
@@ -3010,7 +3007,7 @@ impl<'a> Iterator for RecordBatchIter<'a> {
                 .collect();
             self.idx += 1;
 
-            Some(ArrowChunk::new(batch_cols))
+            Some(RecordBatch::new(batch_cols))
         }
     }
 
@@ -3025,14 +3022,14 @@ pub struct PhysRecordBatchIter<'a> {
 }
 
 impl Iterator for PhysRecordBatchIter<'_> {
-    type Item = ArrowChunk;
+    type Item = RecordBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.iters
             .iter_mut()
             .map(|phys_iter| phys_iter.next().cloned())
             .collect::<Option<Vec<_>>>()
-            .map(ArrowChunk::new)
+            .map(RecordBatch::new)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

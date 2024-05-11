@@ -1,5 +1,6 @@
 use polars::lazy::dsl;
 use polars::prelude::*;
+use polars_plan::prelude::UnionArgs;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyFloat, PyInt, PyString};
@@ -118,35 +119,31 @@ pub fn collect_all(lfs: Vec<PyLazyFrame>, py: Python) -> PyResult<Vec<PyDataFram
 }
 
 #[pyfunction]
-pub fn collect_all_with_callback(lfs: Vec<PyLazyFrame>, lambda: PyObject, py: Python) {
+pub fn collect_all_with_callback(lfs: Vec<PyLazyFrame>, lambda: PyObject) {
     use polars_core::utils::rayon::prelude::*;
 
-    py.allow_threads(|| {
-        polars_core::POOL.install(move || {
-            polars_core::POOL.spawn(move || {
-                let result = lfs
-                    .par_iter()
-                    .map(|lf| {
-                        let df = lf.ldf.clone().collect()?;
-                        Ok(PyDataFrame::new(df))
-                    })
-                    .collect::<polars_core::error::PolarsResult<Vec<_>>>()
-                    .map_err(PyPolarsErr::from);
-
-                Python::with_gil(|py| match result {
-                    Ok(dfs) => {
-                        lambda.call1(py, (dfs,)).map_err(|err| err.restore(py)).ok();
-                    },
-                    Err(err) => {
-                        lambda
-                            .call1(py, (PyErr::from(err).to_object(py),))
-                            .map_err(|err| err.restore(py))
-                            .ok();
-                    },
-                })
+    polars_core::POOL.spawn(move || {
+        let result = lfs
+            .par_iter()
+            .map(|lf| {
+                let df = lf.ldf.clone().collect()?;
+                Ok(PyDataFrame::new(df))
             })
-        });
-    });
+            .collect::<polars_core::error::PolarsResult<Vec<_>>>()
+            .map_err(PyPolarsErr::from);
+
+        Python::with_gil(|py| match result {
+            Ok(dfs) => {
+                lambda.call1(py, (dfs,)).map_err(|err| err.restore(py)).ok();
+            },
+            Err(err) => {
+                lambda
+                    .call1(py, (PyErr::from(err).to_object(py),))
+                    .map_err(|err| err.restore(py))
+                    .ok();
+            },
+        })
+    })
 }
 
 #[pyfunction]
@@ -156,7 +153,7 @@ pub fn cols(names: Vec<String>) -> PyExpr {
 
 #[pyfunction]
 pub fn concat_lf(
-    seq: &PyAny,
+    seq: &Bound<'_, PyAny>,
     rechunk: bool,
     parallel: bool,
     to_supertypes: bool,
@@ -166,7 +163,7 @@ pub fn concat_lf(
 
     for res in seq.iter()? {
         let item = res?;
-        let lf = get_lf(item)?;
+        let lf = get_lf(&item)?;
         lfs.push(lf);
     }
 
@@ -176,6 +173,7 @@ pub fn concat_lf(
             rechunk,
             parallel,
             to_supertypes,
+            ..Default::default()
         },
     )
     .map_err(PyPolarsErr::from)?;
@@ -272,7 +270,7 @@ pub fn datetime(
 
 #[pyfunction]
 pub fn concat_lf_diagonal(
-    lfs: &PyAny,
+    lfs: &Bound<'_, PyAny>,
     rechunk: bool,
     parallel: bool,
     to_supertypes: bool,
@@ -282,7 +280,7 @@ pub fn concat_lf_diagonal(
     let lfs = iter
         .map(|item| {
             let item = item?;
-            get_lf(item)
+            get_lf(&item)
         })
         .collect::<PyResult<Vec<_>>>()?;
 
@@ -292,6 +290,7 @@ pub fn concat_lf_diagonal(
             rechunk,
             parallel,
             to_supertypes,
+            ..Default::default()
         },
     )
     .map_err(PyPolarsErr::from)?;
@@ -299,13 +298,13 @@ pub fn concat_lf_diagonal(
 }
 
 #[pyfunction]
-pub fn concat_lf_horizontal(lfs: &PyAny, parallel: bool) -> PyResult<PyLazyFrame> {
+pub fn concat_lf_horizontal(lfs: &Bound<'_, PyAny>, parallel: bool) -> PyResult<PyLazyFrame> {
     let iter = lfs.iter()?;
 
     let lfs = iter
         .map(|item| {
             let item = item?;
-            get_lf(item)
+            get_lf(&item)
         })
         .collect::<PyResult<Vec<_>>>()?;
 
@@ -313,6 +312,7 @@ pub fn concat_lf_horizontal(lfs: &PyAny, parallel: bool) -> PyResult<PyLazyFrame
         rechunk: false, // No need to rechunk with horizontal concatenation
         parallel,
         to_supertypes: false,
+        ..Default::default()
     };
     let lf = dsl::functions::concat_lf_horizontal(lfs, args).map_err(PyPolarsErr::from)?;
     Ok(lf.into())
@@ -387,29 +387,26 @@ pub fn last() -> PyExpr {
 }
 
 #[pyfunction]
-pub fn lit(value: &PyAny, allow_object: bool) -> PyResult<PyExpr> {
+pub fn nth(n: i64) -> PyExpr {
+    dsl::nth(n).into()
+}
+
+#[pyfunction]
+pub fn lit(value: &Bound<'_, PyAny>, allow_object: bool) -> PyResult<PyExpr> {
     if value.is_instance_of::<PyBool>() {
         let val = value.extract::<bool>().unwrap();
         Ok(dsl::lit(val).into())
     } else if let Ok(int) = value.downcast::<PyInt>() {
-        if let Ok(val) = int.extract::<i32>() {
-            Ok(dsl::lit(val).into())
-        } else if let Ok(val) = int.extract::<i64>() {
-            Ok(dsl::lit(val).into())
-        } else {
-            let val = int.extract::<u64>().unwrap();
-            Ok(dsl::lit(val).into())
-        }
+        let v = int
+            .extract::<i128>()
+            .map_err(|e| polars_err!(InvalidOperation: "integer too large for Polars: {e}"))
+            .map_err(PyPolarsErr::from)?;
+        Ok(Expr::Literal(LiteralValue::Int(v)).into())
     } else if let Ok(float) = value.downcast::<PyFloat>() {
         let val = float.extract::<f64>().unwrap();
-        Ok(dsl::lit(val).into())
+        Ok(Expr::Literal(LiteralValue::Float(val)).into())
     } else if let Ok(pystr) = value.downcast::<PyString>() {
-        Ok(dsl::lit(
-            pystr
-                .to_str()
-                .expect("could not transform Python string to Rust Unicode"),
-        )
-        .into())
+        Ok(dsl::lit(pystr.to_string()).into())
     } else if let Ok(series) = value.extract::<PySeries>() {
         Ok(dsl::lit(series.series).into())
     } else if value.is_none() {
@@ -423,8 +420,10 @@ pub fn lit(value: &PyAny, allow_object: bool) -> PyResult<PyExpr> {
         Ok(dsl::lit(s).into())
     } else {
         Err(PyTypeError::new_err(format!(
-            "invalid literal value: {:?}",
-            value.str()?
+            "cannot create expression literal for value of type {}: {}\
+            \n\nHint: Pass `allow_object=True` to accept any value and create a literal of type Object.",
+            value.get_type().qualname()?,
+            value.repr()?
         )))
     }
 }
@@ -464,16 +463,6 @@ pub fn repeat(value: PyExpr, n: PyExpr, dtype: Option<Wrap<DataType>>) -> PyResu
         value = value.cast(dtype.0);
     }
 
-    if let Expr::Literal(lv) = &value {
-        let av = lv.to_any_value().unwrap();
-        // Integer inputs that fit in Int32 are parsed as such
-        if let DataType::Int64 = av.dtype() {
-            let int_value = av.try_extract::<i64>().unwrap();
-            if int_value >= i32::MIN as i64 && int_value <= i32::MAX as i64 {
-                value = value.cast(DataType::Int32);
-            }
-        }
-    }
     Ok(dsl::repeat(value, n).into())
 }
 

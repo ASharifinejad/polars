@@ -158,6 +158,7 @@ from polars.functions import (
     min,
     min_horizontal,
     n_unique,
+    nth,
     ones,
     quantile,
     reduce,
@@ -297,6 +298,7 @@ __all__ = [
     "PolarsDataType",
     # polars.io
     "read_avro",
+    "read_clipboard",
     "read_csv",
     "read_csv_batched",
     "read_database",
@@ -318,7 +320,6 @@ __all__ = [
     "scan_ndjson",
     "scan_parquet",
     "scan_pyarrow_dataset",
-    "read_clipboard",
     # polars.stringcache
     "StringCache",
     "disable_string_cache",
@@ -401,6 +402,7 @@ __all__ = [
     "mean",
     "median",
     "n_unique",
+    "nth",
     "quantile",
     "reduce",
     "rolling_corr",

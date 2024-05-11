@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 use std::fmt;
-use std::fmt::{Debug, Display, Formatter, Write};
+use std::fmt::{Debug, Display, Formatter};
 use std::path::PathBuf;
+
+use polars_core::prelude::AnyValue;
 
 use crate::prelude::*;
 
@@ -12,7 +14,7 @@ fn write_scan<P: Display>(
     path: &[PathBuf],
     indent: usize,
     n_columns: i64,
-    total_columns: usize,
+    total_columns: Option<usize>,
     predicate: &Option<P>,
     n_rows: Option<usize>,
 ) -> fmt::Result {
@@ -28,6 +30,9 @@ fn write_scan<P: Display>(
             path[0].to_string_lossy()
         )),
     };
+    let total_columns = total_columns
+        .map(|v| format!("{v}"))
+        .unwrap_or_else(|| "?".to_string());
 
     write!(f, "{:indent$}{name} SCAN {path_fmt}", "")?;
     if n_columns > 0 {
@@ -48,17 +53,17 @@ fn write_scan<P: Display>(
     Ok(())
 }
 
-impl LogicalPlan {
+impl DslPlan {
     fn _format(&self, f: &mut Formatter, indent: usize) -> fmt::Result {
         if indent != 0 {
             writeln!(f)?;
         }
         let sub_indent = indent + 2;
-        use LogicalPlan::*;
+        use DslPlan::*;
         match self {
             #[cfg(feature = "python")]
             PythonScan { options } => {
-                let total_columns = options.schema.len();
+                let total_columns = Some(options.schema.len());
                 let n_columns = options
                     .with_columns
                     .as_ref()
@@ -76,14 +81,16 @@ impl LogicalPlan {
                     options.n_rows,
                 )
             },
-            Union { inputs, options } => {
-                let mut name = String::new();
-                let name = if let Some(slice) = options.slice {
-                    write!(name, "SLICED UNION: {slice:?}")?;
-                    name.as_str()
-                } else {
-                    "UNION"
-                };
+            Union { inputs, .. } => {
+                // let mut name = String::new();
+                // THIS is commented out, but must be restored once we format IR's
+                // let name = if let Some(slice) = options.slice {
+                //     write!(name, "SLICED UNION: {slice:?}")?;
+                //     name.as_str()
+                // } else {
+                //     "UNION"
+                // };
+                let name = "UNION";
                 // 3 levels of indentation
                 // - 0 => UNION ... END UNION
                 // - 1 => PLAN 0, PLAN 1, ... PLAN N
@@ -136,7 +143,7 @@ impl LogicalPlan {
                     paths,
                     sub_indent,
                     n_columns,
-                    file_info.schema.len(),
+                    file_info.as_ref().map(|fi| fi.schema.len()),
                     predicate,
                     file_options.n_rows,
                 )
@@ -228,7 +235,6 @@ impl LogicalPlan {
                 write!(f, "{:indent$}{function_fmt}", "")?;
                 input._format(f, sub_indent)
             },
-            Error { err, .. } => write!(f, "{err:?}"),
             ExtContext { input, .. } => {
                 write!(f, "{:indent$}EXTERNAL_CONTEXT", "")?;
                 input._format(f, sub_indent)
@@ -247,7 +253,7 @@ impl LogicalPlan {
     }
 }
 
-impl Debug for LogicalPlan {
+impl Debug for DslPlan {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self._format(f, 0)
     }
@@ -440,6 +446,11 @@ impl Debug for LiteralValue {
                     write!(f, "Series[{name}]")
                 }
             },
+            Float(v) => {
+                let av = AnyValue::Float64(*v);
+                write!(f, "dyn float: {}", av)
+            },
+            Int(v) => write!(f, "dyn int: {}", v),
             _ => {
                 let av = self.to_any_value().unwrap();
                 write!(f, "{av}")

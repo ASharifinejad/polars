@@ -457,21 +457,21 @@ pub trait StringNameSpaceImpl: AsString {
     fn split_exact(&self, by: &StringChunked, n: usize) -> PolarsResult<StructChunked> {
         let ca = self.as_string();
 
-        split_to_struct(ca, by, n + 1, |s, by| s.split(by))
+        split_to_struct(ca, by, n + 1, str::split, false)
     }
 
     #[cfg(feature = "dtype-struct")]
     fn split_exact_inclusive(&self, by: &StringChunked, n: usize) -> PolarsResult<StructChunked> {
         let ca = self.as_string();
 
-        split_to_struct(ca, by, n + 1, |s, by| s.split_inclusive(by))
+        split_to_struct(ca, by, n + 1, str::split_inclusive, false)
     }
 
     #[cfg(feature = "dtype-struct")]
     fn splitn(&self, by: &StringChunked, n: usize) -> PolarsResult<StructChunked> {
         let ca = self.as_string();
 
-        split_to_struct(ca, by, n, |s, by| s.splitn(n, by))
+        split_to_struct(ca, by, n, |s, by| s.splitn(n, by), true)
     }
 
     fn split(&self, by: &StringChunked) -> ListChunked {
@@ -611,6 +611,29 @@ pub trait StringNameSpaceImpl: AsString {
         let length = length.strict_cast(&DataType::UInt64)?;
 
         Ok(substring::substring(ca, offset.i64()?, length.u64()?))
+    }
+
+    /// Slice the first `n` values of the string.
+    ///
+    /// Determines a substring starting at the beginning of the string up to offset `n` of each
+    /// element in `array`. `n` can be negative, in which case the slice ends `n` characters from
+    /// the end of the string.
+    fn str_head(&self, n: &Series) -> PolarsResult<StringChunked> {
+        let ca = self.as_string();
+        let n = n.strict_cast(&DataType::Int64)?;
+
+        Ok(substring::head(ca, n.i64()?))
+    }
+
+    /// Slice the last `n` values of the string.
+    ///
+    /// Determines a substring starting at offset `n` of each element in `array`. `n` can be
+    /// negative, in which case the slice begins `n` characters from the start of the string.
+    fn str_tail(&self, n: &Series) -> PolarsResult<StringChunked> {
+        let ca = self.as_string();
+        let n = n.strict_cast(&DataType::Int64)?;
+
+        Ok(substring::tail(ca, n.i64()?))
     }
 }
 

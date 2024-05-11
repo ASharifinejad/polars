@@ -93,7 +93,8 @@ fn test_cast_exprs() {
     context.register("df", df.clone().lazy());
     let sql = r#"
         SELECT
-            cast(a as FLOAT) as floats,
+            cast(a as FLOAT) as f64,
+            cast(a as FLOAT(24)) as f32,
             cast(a as INT) as ints,
             cast(a as BIGINT) as bigints,
             cast(a as STRING) as strings,
@@ -103,7 +104,8 @@ fn test_cast_exprs() {
     let df_pl = df
         .lazy()
         .select(&[
-            col("a").cast(DataType::Float32).alias("floats"),
+            col("a").cast(DataType::Float64).alias("f64"),
+            col("a").cast(DataType::Float32).alias("f32"),
             col("a").cast(DataType::Int32).alias("ints"),
             col("a").cast(DataType::Int64).alias("bigints"),
             col("a").cast(DataType::String).alias("strings"),
@@ -140,6 +142,37 @@ fn test_literal_exprs() {
         .collect()
         .unwrap();
     assert!(df_sql.equals_missing(&df_pl));
+}
+
+#[test]
+fn test_implicit_date_string() {
+    let df = df! {
+        "idx" => &[Some(0), Some(1), Some(2), Some(3)],
+        "dt" => &[Some("1955-10-01"), None, Some("2007-07-05"), Some("2077-06-11")],
+    }
+    .unwrap()
+    .lazy()
+    .select(vec![col("idx"), col("dt").cast(DataType::Date)])
+    .collect()
+    .unwrap();
+
+    let mut context = SQLContext::new();
+    context.register("frame", df.clone().lazy());
+    for sql in [
+        "SELECT idx, dt FROM frame WHERE dt >= '2007-07-05'",
+        "SELECT idx, dt FROM frame WHERE dt::date >= '2007-07-05'",
+        "SELECT idx, dt FROM frame WHERE dt::datetime >= '2007-07-05 00:00:00'",
+        "SELECT idx, dt FROM frame WHERE dt::timestamp >= '2007-07-05 00:00:00'",
+    ] {
+        let df_sql = context.execute(sql).unwrap().collect().unwrap();
+        let df_pl = df
+            .clone()
+            .lazy()
+            .filter(col("idx").gt_eq(lit(2)))
+            .collect()
+            .unwrap();
+        assert!(df_sql.equals(&df_pl));
+    }
 }
 
 #[test]
@@ -329,7 +362,7 @@ fn test_agg_functions() {
 }
 
 #[test]
-fn create_table() {
+fn test_create_table() {
     let df = create_sample_df().unwrap();
     let mut context = SQLContext::new();
     context.register("df", df.clone().lazy());

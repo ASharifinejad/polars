@@ -73,8 +73,13 @@ from polars.datatypes import (
     N_INFER_DEFAULT,
     Boolean,
     Float64,
+    Int32,
+    Int64,
     Object,
     String,
+    UInt16,
+    UInt32,
+    UInt64,
 )
 from polars.dependencies import (
     _HVPLOT_AVAILABLE,
@@ -108,7 +113,7 @@ from polars.io.spreadsheet._write_utils import (
 )
 from polars.selectors import _expand_selector_dicts, _expand_selectors
 from polars.slice import PolarsSlice
-from polars.type_aliases import DbWriteMode
+from polars.type_aliases import DbWriteMode, TorchExportType
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
     from polars.polars import dtype_str_repr as _dtype_str_repr
@@ -121,11 +126,13 @@ if TYPE_CHECKING:
     from typing import Literal
 
     import deltalake
+    import torch
     from hvplot.plotting.core import hvPlotTabularPolars
     from xlsxwriter import Workbook
 
     from polars import DataType, Expr, LazyFrame, Series
     from polars.interchange.dataframe import PolarsDataFrame
+    from polars.ml.torch import PolarsDataset
     from polars.polars import PyDataFrame
     from polars.type_aliases import (
         AsofJoinStrategy,
@@ -137,6 +144,7 @@ if TYPE_CHECKING:
         ColumnWidthsDefinition,
         ComparisonOperator,
         ConditionalFormatDict,
+        ConnectionOrCursor,
         CsvQuoteStyle,
         DbWriteEngine,
         FillNullStrategy,
@@ -1612,6 +1620,178 @@ class DataFrame:
 
         return out
 
+    @overload
+    def to_torch(
+        self,
+        return_type: Literal["tensor"] = ...,
+        *,
+        label: str | Expr | Sequence[str | Expr] | None = ...,
+        features: str | Expr | Sequence[str | Expr] | None = ...,
+        dtype: PolarsDataType | None = ...,
+    ) -> torch.Tensor: ...
+
+    @overload
+    def to_torch(
+        self,
+        return_type: Literal["dataset"],
+        *,
+        label: str | Expr | Sequence[str | Expr] | None = ...,
+        features: str | Expr | Sequence[str | Expr] | None = ...,
+        dtype: PolarsDataType | None = ...,
+    ) -> PolarsDataset: ...
+
+    @overload
+    def to_torch(
+        self,
+        return_type: Literal["dict"],
+        *,
+        label: str | Expr | Sequence[str | Expr] | None = ...,
+        features: str | Expr | Sequence[str | Expr] | None = ...,
+        dtype: PolarsDataType | None = ...,
+    ) -> dict[str, torch.Tensor]: ...
+
+    def to_torch(
+        self,
+        return_type: TorchExportType = "tensor",
+        *,
+        label: str | Expr | Sequence[str | Expr] | None = None,
+        features: str | Expr | Sequence[str | Expr] | None = None,
+        dtype: PolarsDataType | None = None,
+    ) -> torch.Tensor | dict[str, torch.Tensor] | PolarsDataset:
+        """
+        Convert DataFrame to a 2D PyTorch tensor, Dataset, or dict of Tensors.
+
+        .. versionadded:: 0.20.23
+
+        Parameters
+        ----------
+        return_type : {"tensor", "dataset", "dict"}
+            Set return type; a 2D PyTorch tensor, PolarsDataset (a frame-specialized
+            TensorDataset), or dict of Tensors.
+        label
+            One or more column names or expressions that label the feature data; when
+            `return_type` is "dataset", the PolarsDataset returns `(features, label)`
+            tensor tuples for each row. Otherwise, it returns `(features,)` tensor
+            tuples where the feature contains all the row data. This parameter is a
+            no-op for the other return-types.
+        features
+            One or more column names or expressions that contain the feature data; if
+            omitted, all columns that are not designated as part of the label are used.
+            This parameter is a no-op for return-types other than "dataset".
+        dtype
+            Unify the dtype of all returned tensors; this casts any frame Series
+            that are not of the required dtype before converting to tensor. This
+            includes the label column *unless* the label is an expression (such
+            as `pl.col("label_column").cast(pl.Int16)`).
+
+        Examples
+        --------
+        >>> df = pl.DataFrame(
+        ...     {
+        ...         "lbl": [0, 1, 2, 3],
+        ...         "feat1": [1, 0, 0, 1],
+        ...         "feat2": [1.5, -0.5, 0.0, -2.25],
+        ...     }
+        ... )
+
+        Standard return type (Tensor), with f32 supertype:
+
+        >>> df.to_torch(dtype=pl.Float32)
+        tensor([[ 0.0000,  1.0000,  1.5000],
+                [ 1.0000,  0.0000, -0.5000],
+                [ 2.0000,  0.0000,  0.0000],
+                [ 3.0000,  1.0000, -2.2500]])
+
+        As a dictionary of individual Tensors:
+
+        >>> df.to_torch("dict")
+        {'lbl': tensor([0, 1, 2, 3]),
+         'feat1': tensor([1, 0, 0, 1]),
+         'feat2': tensor([ 1.5000, -0.5000,  0.0000, -2.2500], dtype=torch.float64)}
+
+        As a PolarsDataset, with f64 supertype:
+
+        >>> ds = df.to_torch("dataset", dtype=pl.Float64)
+        >>> ds[3]
+        (tensor([ 3.0000,  1.0000, -2.2500], dtype=torch.float64),)
+        >>> ds[:2]
+        (tensor([[ 0.0000,  1.0000,  1.5000],
+                 [ 1.0000,  0.0000, -0.5000]], dtype=torch.float64),)
+        >>> ds[[0, 3]]
+        (tensor([[ 0.0000,  1.0000,  1.5000],
+                 [ 3.0000,  1.0000, -2.2500]], dtype=torch.float64),)
+
+        As a convenience the PolarsDataset can opt-in to half-precision data
+        for experimentation (usually this would be set on the model/pipeline):
+
+        >>> list(ds.half())
+        [(tensor([0.0000, 1.0000, 1.5000], dtype=torch.float16),),
+         (tensor([ 1.0000,  0.0000, -0.5000], dtype=torch.float16),),
+         (tensor([2., 0., 0.], dtype=torch.float16),),
+         (tensor([ 3.0000,  1.0000, -2.2500], dtype=torch.float16),)]
+
+        Pass PolarsDataset to a DataLoader, designating the label:
+
+        >>> from torch.utils.data import DataLoader
+        >>> ds = df.to_torch("dataset", label="lbl")
+        >>> dl = DataLoader(ds, batch_size=2)
+        >>> batches = list(dl)
+        >>> batches[0]
+        [tensor([[ 1.0000,  1.5000],
+                 [ 0.0000, -0.5000]], dtype=torch.float64), tensor([0, 1])]
+
+        Note that labels can be given as expressions, allowing them to have
+        a dtype independent of the feature columns (multi-column labels are
+        supported).
+
+        >>> ds = df.to_torch(
+        ...     "dataset",
+        ...     dtype=pl.Float32,
+        ...     label=pl.col("lbl").cast(pl.Int16),
+        ... )
+        >>> ds[:2]
+        (tensor([[ 1.0000,  1.5000],
+                 [ 0.0000, -0.5000]]), tensor([0, 1], dtype=torch.int16))
+
+        Easily integrate with (for example) scikit-learn and other datasets:
+
+        >>> from sklearn.datasets import fetch_california_housing  # doctest: +SKIP
+        >>> housing = fetch_california_housing()  # doctest: +SKIP
+        >>> df = pl.DataFrame(
+        ...     data=housing.data,
+        ...     schema=housing.feature_names,
+        ... ).with_columns(
+        ...     Target=housing.target,
+        ... )  # doctest: +SKIP
+        >>> train = df.to_torch("dataset", label="Target")  # doctest: +SKIP
+        >>> loader = DataLoader(
+        ...     train,
+        ...     shuffle=True,
+        ...     batch_size=64,
+        ... )  # doctest: +SKIP
+        """
+        torch = import_optional("torch")
+
+        if dtype in (UInt16, UInt32, UInt64):
+            msg = f"PyTorch does not support u16, u32, or u64 dtypes; given {dtype}"
+            raise ValueError(msg)
+        else:
+            to_dtype = dtype or {UInt16: Int32, UInt32: Int64, UInt64: Int64}
+            frame = self.cast(to_dtype)  # type: ignore[arg-type]
+
+        if return_type == "tensor":
+            return torch.from_numpy(frame.to_numpy(writable=True, use_pyarrow=False))
+        elif return_type == "dict":
+            return {srs.name: srs.to_torch() for srs in frame}
+        elif return_type == "dataset":
+            from polars.ml.torch import PolarsDataset
+
+            return PolarsDataset(frame, label=label, features=features)
+        else:
+            valid_torch_types = ", ".join(get_args(TorchExportType))
+            msg = f"invalid `return_type`: {return_type!r}\nExpected one of: {valid_torch_types}"
+            raise ValueError(msg)
+
     def to_pandas(
         self,
         *,
@@ -2982,13 +3162,14 @@ class DataFrame:
     def write_database(
         self,
         table_name: str,
-        connection: str,
+        connection: ConnectionOrCursor | str,
         *,
         if_table_exists: DbWriteMode = "fail",
-        engine: DbWriteEngine = "sqlalchemy",
+        engine: DbWriteEngine | None = None,
+        engine_options: dict[str, Any] | None = None,
     ) -> int:
         """
-        Write a polars frame to a database.
+        Write the data in a Polars DataFrame to a database.
 
         Parameters
         ----------
@@ -2997,7 +3178,8 @@ class DataFrame:
             SQL database. If your table name contains special characters, it should
             be quoted.
         connection
-            Connection URI string, for example:
+            An existing SQLAlchemy or ADBC connection against the target database, or
+            a URI string that will be used to instantiate such a connection, such as:
 
             * "postgresql://user:pass@server:port/database"
             * "sqlite:////path/to/database.db"
@@ -3008,7 +3190,38 @@ class DataFrame:
             * 'append' will append to an existing table.
             * 'fail' will fail if table already exists.
         engine : {'sqlalchemy', 'adbc'}
-            Select the engine to use for writing frame data.
+            Select the engine to use for writing frame data; only necessary when
+            supplying a URI string (defaults to 'sqlalchemy' if unset)
+        engine_options
+            Additional options to pass to the engine's associated insert method:
+
+            * "sqlalchemy" - currently inserts using Pandas' `to_sql` method, though
+              this will eventually be phased out in favour of a native solution.
+            * "adbc" - inserts using the ADBC cursor's `adbc_ingest` method.
+
+        Examples
+        --------
+        Insert into a temporary table using a PostgreSQL URI and the ADBC engine:
+
+        >>> df.write_database(
+        ...     table_name="target_table",
+        ...     connection="postgresql://user:pass@server:port/database",
+        ...     engine="adbc",
+        ...     engine_options={"temporary": True},
+        ... )  # doctest: +SKIP
+
+        Insert into a table using a `pyodbc` SQLAlchemy connection to SQL Server
+        that was instantiated with "fast_executemany=True" to improve performance:
+
+        >>> pyodbc_uri = (
+        ...     "mssql+pyodbc://user:pass@server:1433/test?"
+        ...     "driver=ODBC+Driver+18+for+SQL+Server"
+        ... )
+        >>> engine = create_engine(pyodbc_uri, fast_executemany=True)  # doctest: +SKIP
+        >>> df.write_database(
+        ...     table_name="target_table",
+        ...     connection=engine,
+        ... )  # doctest: +SKIP
 
         Returns
         -------
@@ -3020,6 +3233,16 @@ class DataFrame:
             allowed = ", ".join(repr(m) for m in valid_write_modes)
             msg = f"write_database `if_table_exists` must be one of {{{allowed}}}, got {if_table_exists!r}"
             raise ValueError(msg)
+
+        if engine is None:
+            if (
+                isinstance(connection, str)
+                or (module_root := type(connection).__module__.split(".", 1)[0])
+                == "sqlalchemy"
+            ):
+                engine = "sqlalchemy"
+            elif module_root.startswith("adbc"):
+                engine = "adbc"
 
         def unpack_table_name(name: str) -> tuple[str | None, str | None, str]:
             """Unpack optionally qualified table name to catalog/schema/table tuple."""
@@ -3033,19 +3256,10 @@ class DataFrame:
             return catalog, schema, tbl  # type: ignore[return-value]
 
         if engine == "adbc":
-            try:
-                import adbc_driver_manager
-
-                adbc_version = parse_version(
-                    getattr(adbc_driver_manager, "__version__", "0.0")
-                )
-            except ModuleNotFoundError as exc:
-                msg = (
-                    "adbc_driver_manager not found"
-                    "\n\nInstall Polars with: pip install adbc_driver_manager"
-                )
-                raise ModuleNotFoundError(msg) from exc
-
+            adbc_driver_manager = import_optional("adbc_driver_manager")
+            adbc_version = parse_version(
+                getattr(adbc_driver_manager, "__version__", "0.0")
+            )
             from polars.io.database._utils import _open_adbc_connection
 
             if if_table_exists == "fail":
@@ -3067,7 +3281,12 @@ class DataFrame:
                 )
                 raise ValueError(msg)
 
-            with _open_adbc_connection(connection) as conn, conn.cursor() as cursor:
+            conn = (
+                _open_adbc_connection(connection)
+                if isinstance(connection, str)
+                else connection
+            )
+            with conn, conn.cursor() as cursor:
                 catalog, db_schema, unpacked_table_name = unpack_table_name(table_name)
                 n_rows: int
                 if adbc_version >= (0, 7):
@@ -3095,26 +3314,35 @@ class DataFrame:
                     )
                 else:
                     n_rows = cursor.adbc_ingest(
-                        unpacked_table_name, self.to_arrow(), mode
+                        table_name=unpacked_table_name,
+                        data=self.to_arrow(),
+                        mode=mode,
+                        **(engine_options or {}),
                     )
                 conn.commit()
             return n_rows
 
         elif engine == "sqlalchemy":
             if not _PANDAS_AVAILABLE:
-                msg = "writing with engine 'sqlalchemy' currently requires pandas.\n\nInstall with: pip install pandas"
+                msg = "writing with 'sqlalchemy' engine currently requires pandas.\n\nInstall with: pip install pandas"
                 raise ModuleNotFoundError(msg)
-            elif parse_version(pd.__version__) < (1, 5):
-                msg = f"writing with engine 'sqlalchemy' requires pandas 1.5.x or higher, found {pd.__version__!r}"
+            elif (pd_version := parse_version(pd.__version__)) < (1, 5):
+                msg = f"writing with 'sqlalchemy' engine requires pandas >= 1.5; found {pd.__version__!r}"
                 raise ModuleUpgradeRequired(msg)
-            try:
-                from sqlalchemy import create_engine
-            except ModuleNotFoundError as exc:
-                msg = "sqlalchemy not found\n\nInstall with: pip install polars[sqlalchemy]"
-                raise ModuleNotFoundError(msg) from exc
 
+            import_optional(
+                module_name="sqlalchemy",
+                min_version=("2.0" if pd_version >= parse_version("2.2") else "1.4"),
+                min_err_prefix="pandas >= 2.2 requires",
+            )
             # note: the catalog (database) should be a part of the connection string
-            engine_sa = create_engine(connection)
+            from sqlalchemy.engine import create_engine
+
+            engine_sa = (
+                create_engine(connection)
+                if isinstance(connection, str)
+                else connection.engine  # type: ignore[union-attr]
+            )
             catalog, db_schema, unpacked_table_name = unpack_table_name(table_name)
             if catalog:
                 msg = f"Unexpected three-part table name; provide the database/catalog ({catalog!r}) on the connection URI"
@@ -3130,11 +3358,16 @@ class DataFrame:
                 con=engine_sa,
                 if_exists=if_table_exists,
                 index=False,
+                **(engine_options or {}),
             )
             return -1 if res is None else res
-        else:
+
+        elif isinstance(engine, str):
             msg = f"engine {engine!r} is not supported"
             raise ValueError(msg)
+        else:
+            msg = f"unrecognised connection type {connection!r}"
+            raise TypeError(msg)
 
     @overload
     def write_delta(
@@ -4122,6 +4355,122 @@ class DataFrame:
             .collect(_eager=True)
         )
 
+    def sql(self, query: str, *, table_name: str | None = None) -> Self:
+        """
+        Execute a SQL query against the DataFrame.
+
+        .. versionadded:: 0.20.24
+
+        .. warning::
+            This functionality is considered **unstable**, although it is close to
+            being considered stable. It may be changed at any point without it being
+            considered a breaking change.
+
+        Parameters
+        ----------
+        query
+            SQL query to execute.
+        table_name
+            Optionally provide an explicit name for the table that represents the
+            calling frame (the alias "self" will always be registered/available).
+
+        Notes
+        -----
+        * The calling frame is automatically registered as a table in the SQL context
+          under the name "self". All DataFrames and LazyFrames found in the current
+          set of global variables are also registered, using their variable name.
+        * More control over registration and execution behaviour is available by
+          using the :class:`SQLContext` object.
+        * The SQL query executes entirely in lazy mode before being collected and
+          returned as a DataFrame.
+
+        See Also
+        --------
+        SQLContext
+
+        Examples
+        --------
+        >>> from datetime import date
+        >>> df1 = pl.DataFrame(
+        ...     {
+        ...         "a": [1, 2, 3],
+        ...         "b": ["zz", "yy", "xx"],
+        ...         "c": [date(1999, 12, 31), date(2010, 10, 10), date(2077, 8, 8)],
+        ...     }
+        ... )
+
+        Query the DataFrame using SQL:
+
+        >>> df1.sql("SELECT c, b FROM self WHERE a > 1")
+        shape: (2, 2)
+        ┌────────────┬─────┐
+        │ c          ┆ b   │
+        │ ---        ┆ --- │
+        │ date       ┆ str │
+        ╞════════════╪═════╡
+        │ 2010-10-10 ┆ yy  │
+        │ 2077-08-08 ┆ xx  │
+        └────────────┴─────┘
+
+        Join two DataFrames using SQL.
+
+        >>> df2 = pl.DataFrame({"a": [3, 2, 1], "d": [125, -654, 888]})
+        >>> df1.sql(
+        ...     '''
+        ...     SELECT self.*, d
+        ...     FROM self
+        ...     INNER JOIN df2 USING (a)
+        ...     WHERE a > 1 AND EXTRACT(year FROM c) < 2050
+        ...     '''
+        ... )
+        shape: (1, 4)
+        ┌─────┬─────┬────────────┬──────┐
+        │ a   ┆ b   ┆ c          ┆ d    │
+        │ --- ┆ --- ┆ ---        ┆ ---  │
+        │ i64 ┆ str ┆ date       ┆ i64  │
+        ╞═════╪═════╪════════════╪══════╡
+        │ 2   ┆ yy  ┆ 2010-10-10 ┆ -654 │
+        └─────┴─────┴────────────┴──────┘
+
+        Apply transformations to a DataFrame using SQL, aliasing "self" to "frame".
+
+        >>> df1.sql(
+        ...     query='''
+        ...         SELECT
+        ...             a,
+        ...             (a % 2 == 0) AS a_is_even,
+        ...             CONCAT_WS(':', b, b) AS b_b,
+        ...             EXTRACT(year FROM c) AS year,
+        ...             0::float4 AS "zero",
+        ...         FROM frame
+        ...     ''',
+        ...     table_name="frame",
+        ... )
+        shape: (3, 5)
+        ┌─────┬───────────┬───────┬──────┬──────┐
+        │ a   ┆ a_is_even ┆ b_b   ┆ year ┆ zero │
+        │ --- ┆ ---       ┆ ---   ┆ ---  ┆ ---  │
+        │ i64 ┆ bool      ┆ str   ┆ i32  ┆ f32  │
+        ╞═════╪═══════════╪═══════╪══════╪══════╡
+        │ 1   ┆ false     ┆ zz:zz ┆ 1999 ┆ 0.0  │
+        │ 2   ┆ true      ┆ yy:yy ┆ 2010 ┆ 0.0  │
+        │ 3   ┆ false     ┆ xx:xx ┆ 2077 ┆ 0.0  │
+        └─────┴───────────┴───────┴──────┴──────┘
+        """
+        from polars.sql import SQLContext
+
+        issue_unstable_warning(
+            "`sql` is considered **unstable** (although it is close to being considered stable)."
+        )
+        with SQLContext(
+            register_globals=True,
+            eager_execution=True,
+        ) as ctx:
+            frames = {table_name: self} if table_name else {}
+            frames["self"] = self
+            ctx.register_many(frames)
+            return ctx.execute(query)  # type: ignore[return-value]
+
     def top_k(
         self,
         k: int,
@@ -4352,6 +4701,10 @@ class DataFrame:
     def replace(self, column: str, new_column: Series) -> Self:
         """
         Replace a column by a new Series.
+
+        .. deprecated:: 0.19.0
+            Use :meth:`with_columns` instead, e.g.
+            `df = df.with_columns(new_column.alias(column_name))`.
 
         Parameters
         ----------
@@ -4792,7 +5145,7 @@ class DataFrame:
         """
         Add a column at index 0 that counts the rows.
 
-        .. deprecated::
+        .. deprecated:: 0.20.4
             Use :meth:`with_row_index` instead.
             Note that the default column name has changed from 'row_nr' to 'index'.
 
@@ -5644,7 +5997,6 @@ class DataFrame:
                 - 1mo   (1 calendar month)
                 - 1q    (1 calendar quarter)
                 - 1y    (1 calendar year)
-                - 1i    (1 index count)
 
                 Or combine them:
                 "3d12h4m25s" # 3 days, 12 hours, 4 minutes, and 25 seconds
@@ -5768,6 +6120,83 @@ class DataFrame:
 
         - date `2016-03-01` from `population` is matched with `2016-01-01` from `gdp`;
         - date `2018-08-01` from `population` is matched with `2019-01-01` from `gdp`.
+
+        They `by` argument allows joining on another column first, before the asof join.
+        In this example we join by `country` first, then asof join by date, as above.
+
+        >>> gdp_dates = pl.date_range(  # fmt: skip
+        ...     date(2016, 1, 1), date(2020, 1, 1), "1y", eager=True
+        ... )
+        >>> gdp2 = pl.DataFrame(
+        ...     {
+        ...         "country": ["Germany"] * 5 + ["Netherlands"] * 5,
+        ...         "date": pl.concat([gdp_dates, gdp_dates]),
+        ...         "gdp": [4164, 4411, 4566, 4696, 4827, 784, 833, 914, 910, 909],
+        ...     }
+        ... ).sort("country", "date")
+        >>>
+        >>> gdp2
+        shape: (10, 3)
+        ┌─────────────┬────────────┬──────┐
+        │ country     ┆ date       ┆ gdp  │
+        │ ---         ┆ ---        ┆ ---  │
+        │ str         ┆ date       ┆ i64  │
+        ╞═════════════╪════════════╪══════╡
+        │ Germany     ┆ 2016-01-01 ┆ 4164 │
+        │ Germany     ┆ 2017-01-01 ┆ 4411 │
+        │ Germany     ┆ 2018-01-01 ┆ 4566 │
+        │ Germany     ┆ 2019-01-01 ┆ 4696 │
+        │ Germany     ┆ 2020-01-01 ┆ 4827 │
+        │ Netherlands ┆ 2016-01-01 ┆ 784  │
+        │ Netherlands ┆ 2017-01-01 ┆ 833  │
+        │ Netherlands ┆ 2018-01-01 ┆ 914  │
+        │ Netherlands ┆ 2019-01-01 ┆ 910  │
+        │ Netherlands ┆ 2020-01-01 ┆ 909  │
+        └─────────────┴────────────┴──────┘
+        >>> pop2 = pl.DataFrame(
+        ...     {
+        ...         "country": ["Germany"] * 3 + ["Netherlands"] * 3,
+        ...         "date": [
+        ...             date(2016, 3, 1),
+        ...             date(2018, 8, 1),
+        ...             date(2019, 1, 1),
+        ...             date(2016, 3, 1),
+        ...             date(2018, 8, 1),
+        ...             date(2019, 1, 1),
+        ...         ],
+        ...         "population": [82.19, 82.66, 83.12, 17.11, 17.32, 17.40],
+        ...     }
+        ... ).sort("country", "date")
+        >>>
+        >>> pop2
+        shape: (6, 3)
+        ┌─────────────┬────────────┬────────────┐
+        │ country     ┆ date       ┆ population │
+        │ ---         ┆ ---        ┆ ---        │
+        │ str         ┆ date       ┆ f64        │
+        ╞═════════════╪════════════╪════════════╡
+        │ Germany     ┆ 2016-03-01 ┆ 82.19      │
+        │ Germany     ┆ 2018-08-01 ┆ 82.66      │
+        │ Germany     ┆ 2019-01-01 ┆ 83.12      │
+        │ Netherlands ┆ 2016-03-01 ┆ 17.11      │
+        │ Netherlands ┆ 2018-08-01 ┆ 17.32      │
+        │ Netherlands ┆ 2019-01-01 ┆ 17.4       │
+        └─────────────┴────────────┴────────────┘
+        >>> pop2.join_asof(gdp2, by="country", on="date", strategy="nearest")
+        shape: (6, 4)
+        ┌─────────────┬────────────┬────────────┬──────┐
+        │ country     ┆ date       ┆ population ┆ gdp  │
+        │ ---         ┆ ---        ┆ ---        ┆ ---  │
+        │ str         ┆ date       ┆ f64        ┆ i64  │
+        ╞═════════════╪════════════╪════════════╪══════╡
+        │ Germany     ┆ 2016-03-01 ┆ 82.19      ┆ 4164 │
+        │ Germany     ┆ 2018-08-01 ┆ 82.66      ┆ 4696 │
+        │ Germany     ┆ 2019-01-01 ┆ 83.12      ┆ 4696 │
+        │ Netherlands ┆ 2016-03-01 ┆ 17.11      ┆ 784  │
+        │ Netherlands ┆ 2018-08-01 ┆ 17.32      ┆ 910  │
+        │ Netherlands ┆ 2019-01-01 ┆ 17.4       ┆ 910  │
+        └─────────────┴────────────┴────────────┴──────┘
+
         """
         tolerance = deprecate_saturating(tolerance)
         if not isinstance(other, DataFrame):
@@ -5816,6 +6245,7 @@ class DataFrame:
         suffix: str = "_right",
         validate: JoinValidation = "m:m",
         join_nulls: bool = False,
+        coalesce: bool | None = None,
     ) -> DataFrame:
         """
         Join in SQL-like fashion.
@@ -5868,9 +6298,13 @@ class DataFrame:
             .. note::
 
                 - This is currently not supported the streaming engine.
-                - This is only supported when joined by single columns.
         join_nulls
             Join on null values. By default null values will never produce matches.
+        coalesce
+            Coalescing behavior (merging of join columns).
+            - None: -> join specific.
+            - True: -> Always coalesce join columns.
+            - False: -> Never coalesce join columns.
 
         Returns
         -------
@@ -5971,6 +6405,7 @@ class DataFrame:
                 suffix=suffix,
                 validate=validate,
                 join_nulls=join_nulls,
+                coalesce=coalesce,
             )
             .collect(_eager=True)
         )
@@ -6015,10 +6450,10 @@ class DataFrame:
 
         Notes
         -----
-        * The frame-level `apply` cannot track column names (as the UDF is a black-box
-          that may arbitrarily drop, rearrange, transform, or add new columns); if you
-          want to apply a UDF such that column names are preserved, you should use the
-          expression-level `apply` syntax instead.
+        * The frame-level `map_rows` cannot track column names (as the UDF is a
+          black-box that may arbitrarily drop, rearrange, transform, or add new
+          columns); if you want to apply a UDF such that column names are preserved,
+          you should use the expression-level `map_elements` syntax instead.
 
         * If your function is expensive and you don't want it to be called more than
           once for a given input, consider applying an `@lru_cache` decorator to it.
@@ -6620,7 +7055,7 @@ class DataFrame:
 
     def fill_null(
         self,
-        value: Any | None = None,
+        value: Any | Expr | None = None,
         strategy: FillNullStrategy | None = None,
         limit: int | None = None,
         *,
@@ -6731,7 +7166,7 @@ class DataFrame:
 
         Warnings
         --------
-        Note that floating point NaNs (Not a Number) are not missing values!
+        Note that floating point NaNs (Not a Number) are not missing values.
         To replace missing values, use :func:`fill_null`.
 
         See Also
@@ -7590,7 +8025,7 @@ class DataFrame:
         ...     }
         ... )
         >>> df.lazy()  # doctest: +ELLIPSIS
-        <LazyFrame [3 cols, {"a": Int64 … "c": Boolean}] at ...>
+        <LazyFrame at ...>
         """
         return wrap_ldf(self._df.lazy())
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import typing
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Literal
 
@@ -756,6 +757,58 @@ def test_join_validation() -> None:
             test_each_join_validation(short_unique, long_duplicate, join_col, how)
 
 
+@typing.no_type_check
+def test_join_validation_many_keys() -> None:
+    # unique in both
+    df1 = pl.DataFrame(
+        {
+            "val1": [11, 12, 13, 14],
+            "val2": [1, 2, 3, 4],
+        }
+    )
+    df2 = pl.DataFrame(
+        {
+            "val1": [11, 12, 13, 14],
+            "val2": [1, 2, 3, 4],
+        }
+    )
+    for join_type in ["inner", "left", "outer"]:
+        for val in ["m:m", "m:1", "1:1", "1:m"]:
+            df1.join(df2, on=["val1", "val2"], how=join_type, validate=val)
+
+    # many in lhs
+    df1 = pl.DataFrame(
+        {
+            "val1": [11, 11, 12, 13, 14],
+            "val2": [1, 1, 2, 3, 4],
+        }
+    )
+
+    for join_type in ["inner", "left", "outer"]:
+        for val in ["1:1", "1:m"]:
+            with pytest.raises(pl.ComputeError):
+                df1.join(df2, on=["val1", "val2"], how=join_type, validate=val)
+
+    # many in rhs
+    df1 = pl.DataFrame(
+        {
+            "val1": [11, 12, 13, 14],
+            "val2": [1, 2, 3, 4],
+        }
+    )
+    df2 = pl.DataFrame(
+        {
+            "val1": [11, 11, 12, 13, 14],
+            "val2": [1, 1, 2, 3, 4],
+        }
+    )
+
+    for join_type in ["inner", "left", "outer"]:
+        for val in ["m:1", "1:1"]:
+            with pytest.raises(pl.ComputeError):
+                df1.join(df2, on=["val1", "val2"], how=join_type, validate=val)
+
+
 def test_outer_join_bool() -> None:
     df1 = pl.DataFrame({"id": [True, False], "val": [1, 2]})
     df2 = pl.DataFrame({"id": [True, False], "val": [0, -1]})
@@ -869,3 +922,71 @@ def test_join_4_columns_with_validity() -> None:
         115,
         4,
     )
+
+
+@pytest.mark.release()
+def test_cross_join() -> None:
+    # triggers > 100 rows implementation
+    # https://github.com/pola-rs/polars/blob/5f5acb2a523ce01bc710768b396762b8e69a9e07/polars/polars-core/src/frame/cross_join.rs#L34
+    df1 = pl.DataFrame({"col1": ["a"], "col2": ["d"]})
+    df2 = pl.DataFrame({"frame2": pl.arange(0, 100, eager=True)})
+    out = df2.join(df1, how="cross")
+    df2 = pl.DataFrame({"frame2": pl.arange(0, 101, eager=True)})
+    assert_frame_equal(df2.join(df1, how="cross").slice(0, 100), out)
+
+
+@pytest.mark.release()
+def test_cross_join_slice_pushdown() -> None:
+    # this will likely go out of memory if we did not pushdown the slice
+    df = (
+        pl.Series("x", pl.arange(0, 2**16 - 1, eager=True, dtype=pl.UInt16) % 2**15)
+    ).to_frame()
+
+    result = df.lazy().join(df.lazy(), how="cross", suffix="_").slice(-5, 10).collect()
+    expected = pl.DataFrame(
+        {
+            "x": [32766, 32766, 32766, 32766, 32766],
+            "x_": [32762, 32763, 32764, 32765, 32766],
+        },
+        schema={"x": pl.UInt16, "x_": pl.UInt16},
+    )
+    assert_frame_equal(result, expected)
+
+    result = df.lazy().join(df.lazy(), how="cross", suffix="_").slice(2, 10).collect()
+    expected = pl.DataFrame(
+        {
+            "x": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "x_": [2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        },
+        schema={"x": pl.UInt16, "x_": pl.UInt16},
+    )
+    assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize("how", ["left", "inner"])
+@typing.no_type_check
+def test_join_coalesce(how: str) -> None:
+    a = pl.LazyFrame({"a": [1, 2], "b": [1, 2]})
+    b = pl.LazyFrame(
+        {
+            "a": [1, 2, 1, 2],
+            "b": [5, 7, 8, 9],
+            "c": [1, 2, 1, 2],
+        }
+    )
+
+    how = "inner"
+    q = a.join(b, on="a", coalesce=False, how=how)
+    out = q.collect()
+    assert q.schema == out.schema
+    assert out.columns == ["a", "b", "a_right", "b_right", "c"]
+
+    q = a.join(b, on=["a", "b"], coalesce=False, how=how)
+    out = q.collect()
+    assert q.schema == out.schema
+    assert out.columns == ["a", "b", "a_right", "b_right", "c"]
+
+    q = a.join(b, on=["a", "b"], coalesce=True, how=how)
+    out = q.collect()
+    assert q.schema == out.schema
+    assert out.columns == ["a", "b", "c"]

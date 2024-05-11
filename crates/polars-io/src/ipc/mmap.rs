@@ -3,71 +3,14 @@ use arrow::io::ipc::read::{Dictionaries, FileMetadata};
 use arrow::mmap::{mmap_dictionaries_unchecked, mmap_unchecked};
 use arrow::record_batch::RecordBatch;
 use memmap::Mmap;
+use polars_core::prelude::*;
 
-use super::*;
+use super::ipc_file::IpcReader;
 use crate::mmap::MmapBytesReader;
+use crate::predicates::PhysicalIoExpr;
+use crate::shared::{finish_reader, ArrowReader};
 use crate::utils::{apply_projection, columns_to_projection};
 
-struct MMapChunkIter<'a> {
-    dictionaries: Dictionaries,
-    metadata: FileMetadata,
-    mmap: Arc<Mmap>,
-    idx: usize,
-    end: usize,
-    projection: &'a Option<Vec<usize>>,
-}
-
-impl<'a> MMapChunkIter<'a> {
-    fn new(
-        mmap: Mmap,
-        metadata: FileMetadata,
-        projection: &'a Option<Vec<usize>>,
-    ) -> PolarsResult<Self> {
-        let mmap = Arc::new(mmap);
-
-        let end = metadata.blocks.len();
-        // mmap the dictionaries
-        let dictionaries = unsafe { mmap_dictionaries_unchecked(&metadata, mmap.clone())? };
-
-        Ok(Self {
-            dictionaries,
-            metadata,
-            mmap,
-            idx: 0,
-            end,
-            projection,
-        })
-    }
-}
-
-impl ArrowReader for MMapChunkIter<'_> {
-    fn next_record_batch(&mut self) -> PolarsResult<Option<ArrowChunk>> {
-        if self.idx < self.end {
-            let chunk = unsafe {
-                mmap_unchecked(
-                    &self.metadata,
-                    &self.dictionaries,
-                    self.mmap.clone(),
-                    self.idx,
-                )
-            }?;
-            self.idx += 1;
-            let chunk = match &self.projection {
-                None => chunk,
-                Some(proj) => {
-                    let cols = chunk.into_arrays();
-                    let arrays = proj.iter().map(|i| cols[*i].clone()).collect();
-                    RecordBatch::new(arrays)
-                },
-            };
-            Ok(Some(chunk))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-#[cfg(feature = "ipc")]
 impl<R: MmapBytesReader> IpcReader<R> {
     pub(super) fn finish_memmapped(
         &mut self,
@@ -103,6 +46,65 @@ impl<R: MmapBytesReader> IpcReader<R> {
                 )
             },
             None => polars_bail!(ComputeError: "cannot memory-map, you must provide a file"),
+        }
+    }
+}
+
+struct MMapChunkIter<'a> {
+    dictionaries: Dictionaries,
+    metadata: FileMetadata,
+    mmap: Arc<Mmap>,
+    idx: usize,
+    end: usize,
+    projection: &'a Option<Vec<usize>>,
+}
+
+impl<'a> MMapChunkIter<'a> {
+    fn new(
+        mmap: Mmap,
+        metadata: FileMetadata,
+        projection: &'a Option<Vec<usize>>,
+    ) -> PolarsResult<Self> {
+        let mmap = Arc::new(mmap);
+
+        let end = metadata.blocks.len();
+        // mmap the dictionaries
+        let dictionaries = unsafe { mmap_dictionaries_unchecked(&metadata, mmap.clone())? };
+
+        Ok(Self {
+            dictionaries,
+            metadata,
+            mmap,
+            idx: 0,
+            end,
+            projection,
+        })
+    }
+}
+
+impl ArrowReader for MMapChunkIter<'_> {
+    fn next_record_batch(&mut self) -> PolarsResult<Option<RecordBatch>> {
+        if self.idx < self.end {
+            let chunk = unsafe {
+                mmap_unchecked(
+                    &self.metadata,
+                    &self.dictionaries,
+                    self.mmap.clone(),
+                    self.idx,
+                )
+            }?;
+            self.idx += 1;
+            let chunk = match &self.projection {
+                None => chunk,
+                Some(proj) => {
+                    let cols = chunk.into_arrays();
+                    let arrays = proj.iter().map(|i| cols[*i].clone()).collect();
+                    RecordBatch::new(arrays)
+                },
+            };
+            Ok(Some(chunk))
+        } else {
+            Ok(None)
         }
     }
 }

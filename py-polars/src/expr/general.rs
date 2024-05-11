@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::ops::Neg;
 
 use polars::lazy::dsl;
@@ -6,6 +7,7 @@ use polars::series::ops::NullBehavior;
 use polars_core::series::IsSorted;
 use pyo3::class::basic::CompareOp;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
 use crate::conversion::{parse_fill_null_strategy, vec_extract_wrapped, Wrap};
@@ -83,14 +85,15 @@ impl PyExpr {
         ciborium::ser::into_writer(&self.inner, &mut writer)
             .map_err(|e| PyPolarsErr::Other(format!("{}", e)))?;
 
-        Ok(PyBytes::new(py, &writer).to_object(py))
+        Ok(PyBytes::new_bound(py, &writer).to_object(py))
     }
 
     fn __setstate__(&mut self, py: Python, state: PyObject) -> PyResult<()> {
         // Used in pickle/pickling
-        match state.extract::<&PyBytes>(py) {
+        match state.extract::<PyBackedBytes>(py) {
             Ok(s) => {
-                self.inner = ciborium::de::from_reader(s.as_bytes())
+                let cursor = Cursor::new(&*s);
+                self.inner = ciborium::de::from_reader(cursor)
                     .map_err(|e| PyPolarsErr::Other(format!("{}", e)))?;
                 Ok(())
             },
@@ -290,13 +293,81 @@ impl PyExpr {
     }
 
     #[cfg(feature = "top_k")]
-    fn top_k(&self, k: Self) -> Self {
-        self.inner.clone().top_k(k.inner).into()
+    fn top_k(&self, k: Self, nulls_last: bool, multithreaded: bool) -> Self {
+        self.inner
+            .clone()
+            .top_k(
+                k.inner,
+                SortOptions::default()
+                    .with_nulls_last(nulls_last)
+                    .with_maintain_order(multithreaded),
+            )
+            .into()
     }
 
     #[cfg(feature = "top_k")]
-    fn bottom_k(&self, k: Self) -> Self {
-        self.inner.clone().bottom_k(k.inner).into()
+    fn top_k_by(
+        &self,
+        k: Self,
+        by: Vec<Self>,
+        descending: Vec<bool>,
+        nulls_last: bool,
+        maintain_order: bool,
+        multithreaded: bool,
+    ) -> Self {
+        let by = by.into_iter().map(|e| e.inner).collect::<Vec<_>>();
+        self.inner
+            .clone()
+            .top_k_by(
+                k.inner,
+                by,
+                SortMultipleOptions {
+                    descending,
+                    nulls_last,
+                    multithreaded,
+                    maintain_order,
+                },
+            )
+            .into()
+    }
+
+    #[cfg(feature = "top_k")]
+    fn bottom_k(&self, k: Self, nulls_last: bool, multithreaded: bool) -> Self {
+        self.inner
+            .clone()
+            .bottom_k(
+                k.inner,
+                SortOptions::default()
+                    .with_nulls_last(nulls_last)
+                    .with_maintain_order(multithreaded),
+            )
+            .into()
+    }
+
+    #[cfg(feature = "top_k")]
+    fn bottom_k_by(
+        &self,
+        k: Self,
+        by: Vec<Self>,
+        descending: Vec<bool>,
+        nulls_last: bool,
+        maintain_order: bool,
+        multithreaded: bool,
+    ) -> Self {
+        let by = by.into_iter().map(|e| e.inner).collect::<Vec<_>>();
+        self.inner
+            .clone()
+            .bottom_k_by(
+                k.inner,
+                by,
+                SortMultipleOptions {
+                    descending,
+                    nulls_last,
+                    multithreaded,
+                    maintain_order,
+                },
+            )
+            .into()
     }
 
     #[cfg(feature = "peaks")]
@@ -439,16 +510,17 @@ impl PyExpr {
     fn gather_every(&self, n: usize, offset: usize) -> Self {
         self.inner.clone().gather_every(n, offset).into()
     }
-    fn tail(&self, n: usize) -> Self {
-        self.inner.clone().tail(Some(n)).into()
+
+    fn slice(&self, offset: Self, length: Self) -> Self {
+        self.inner.clone().slice(offset.inner, length.inner).into()
     }
 
     fn head(&self, n: usize) -> Self {
         self.inner.clone().head(Some(n)).into()
     }
 
-    fn slice(&self, offset: Self, length: Self) -> Self {
-        self.inner.clone().slice(offset.inner, length.inner).into()
+    fn tail(&self, n: usize) -> Self {
+        self.inner.clone().tail(Some(n)).into()
     }
 
     fn append(&self, other: Self, upcast: bool) -> Self {
@@ -786,6 +858,14 @@ impl PyExpr {
         };
         self.inner.clone().ewm_mean(options).into()
     }
+    fn ewm_mean_by(&self, times: PyExpr, half_life: &str, check_sorted: bool) -> Self {
+        let half_life = Duration::parse(half_life);
+        self.inner
+            .clone()
+            .ewm_mean_by(times.inner, half_life, check_sorted)
+            .into()
+    }
+
     fn ewm_std(
         &self,
         alpha: f64,

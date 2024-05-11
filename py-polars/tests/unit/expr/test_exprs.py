@@ -296,7 +296,7 @@ def test_expression_appends() -> None:
     assert df.select(pl.repeat(None, 3).append(pl.col("a"))).n_chunks() == 2
     assert df.select(pl.repeat(None, 3).append(pl.col("a")).rechunk()).n_chunks() == 1
 
-    out = df.select(pl.concat([pl.repeat(None, 3), pl.col("a")]))
+    out = df.select(pl.concat([pl.repeat(None, 3), pl.col("a")], rechunk=True))
 
     assert out.n_chunks() == 1
     assert out.to_series().to_list() == [None, None, None, 1, 1, 2]
@@ -693,9 +693,9 @@ def test_repr_long_expression() -> None:
 
 def test_repr_gather() -> None:
     result = repr(pl.col("a").gather(0))
-    assert 'col("a").gather(0)' in result
+    assert 'col("a").gather(dyn int: 0)' in result
     result = repr(pl.col("a").get(0))
-    assert 'col("a").get(0)' in result
+    assert 'col("a").get(dyn int: 0)' in result
 
 
 def test_replace_no_cse() -> None:
