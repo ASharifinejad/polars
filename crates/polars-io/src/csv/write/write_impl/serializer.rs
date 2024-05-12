@@ -30,6 +30,7 @@
 //!     but also with `QUOTE_NON_NULL = false`.
 //!  3. A serializer that quotes only non-nulls. This is a bare serializer with `QUOTE_NON_NULL = true`.
 
+use std::fmt::LowerExp;
 use std::io::Write;
 
 use arrow::array::{Array, BooleanArray, NullArray, PrimitiveArray, Utf8ViewArray};
@@ -40,7 +41,7 @@ use chrono::TimeZone;
 use memchr::{memchr3, memchr_iter};
 use polars_core::prelude::*;
 
-use crate::csv::write::{QuoteStyle, SerializeOptions};
+use crate::csv::write::{QuoteStyle, SciNotationOptions, SerializeOptions};
 
 const TOO_MANY_MSG: &str = "too many items requested from CSV serializer";
 const ARRAY_MISMATCH_MSG: &str = "wrong array type";
@@ -146,6 +147,36 @@ fn float_serializer_with_precision<I: NativeType>(
     let f = move |&item, buf: &mut Vec<u8>, _options: &SerializeOptions| {
         // Float writing into a buffer of `Vec<u8>` cannot fail.
         let _ = write!(buf, "{item:.precision$}");
+    };
+
+    make_serializer::<_, _, false>(f, array.iter(), |array| {
+        array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<I>>()
+            .expect(ARRAY_MISMATCH_MSG)
+            .iter()
+    })
+}
+
+fn float_serializer_with_scientific<I: NativeType + LowerExp>(
+    array: &PrimitiveArray<I>,
+    scientific_options: SciNotationOptions,
+) -> impl Serializer {
+    fn fmt_float<I: LowerExp>(num: I, options: SciNotationOptions) -> String {
+        let mut num = format!("{:.precision$e}", num, precision = options.precision);
+        let exp = num.split_off(num.find('e').unwrap());
+        let (sign, exp) = if let Some(stripped) = exp.strip_prefix("e-") {
+            ('-', stripped)
+        } else {
+            ('+', &exp[1..])
+        };
+        num.push_str(&format!("e{}{:0>pad$}", sign, exp, pad = options.exp_pad));
+
+        format!("{:>width$}", num, width = options.width)
+    }
+    let f = move |&item, buf: &mut Vec<u8>, _options: &SerializeOptions| {
+        // Float writing into a buffer of `Vec<u8>` cannot fail.
+        let _ = write!(buf, "{}", fmt_float(item, scientific_options.clone()));
     };
 
     make_serializer::<_, _, false>(f, array.iter(), |array| {
@@ -464,11 +495,17 @@ pub(super) fn serializer_for<'a>(
         DataType::UInt64 => quote_if_always!(integer_serializer::<u64>),
         DataType::Float32 => match options.float_precision {
             Some(precision) => quote_if_always!(float_serializer_with_precision::<f32>, precision),
-            None => quote_if_always!(float_serializer_no_precision::<f32>),
+            None => match options.float_scientific.clone() {
+                Some(pattern) => quote_if_always!(float_serializer_with_scientific::<f32>, pattern),
+                None => quote_if_always!(float_serializer_no_precision::<f32>),
+            },
         },
         DataType::Float64 => match options.float_precision {
             Some(precision) => quote_if_always!(float_serializer_with_precision::<f64>, precision),
-            None => quote_if_always!(float_serializer_no_precision::<f64>),
+            None => match options.float_scientific.clone() {
+                Some(pattern) => quote_if_always!(float_serializer_with_scientific::<f64>, pattern),
+                None => quote_if_always!(float_serializer_no_precision::<f64>),
+            },
         },
         DataType::Null => quote_if_always!(null_serializer),
         DataType::Boolean => {

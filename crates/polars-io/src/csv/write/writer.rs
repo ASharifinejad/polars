@@ -8,6 +8,7 @@ use polars_error::PolarsResult;
 
 use super::write_impl::{write, write_bom, write_header};
 use super::{QuoteStyle, SerializeOptions};
+use crate::csv::write::SciNotationOptions;
 use crate::shared::SerWriter;
 
 /// Write a DataFrame to csv.
@@ -119,6 +120,14 @@ where
     pub fn with_float_precision(mut self, precision: Option<usize>) -> Self {
         if precision.is_some() {
             self.options.float_precision = precision;
+        }
+        self
+    }
+
+    /// Set the CSV file's float scientific format.
+    pub fn with_float_scientific(mut self, precision: Option<SciNotationOptions>) -> Self {
+        if precision.is_some() {
+            self.options.float_scientific = precision;
         }
         self
     }
