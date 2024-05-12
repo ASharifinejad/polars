@@ -26,6 +26,26 @@ impl Default for CsvWriterOptions {
     }
 }
 
+/// Options to write scietific notation.
+///
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SciNotationOptions {
+    pub width: usize,
+    pub precision: usize,
+    pub exp_pad: usize,
+}
+
+impl Default for SciNotationOptions {
+    fn default() -> Self {
+        SciNotationOptions {
+            width: 25,
+            precision: 15,
+            exp_pad: 3,
+        }
+    }
+}
+
 /// Options to serialize logical types to CSV.
 ///
 /// The default is to format times and dates as `chrono` crate formats them.
@@ -41,6 +61,8 @@ pub struct SerializeOptions {
     /// Used for [`DataType::Float64`](polars_core::datatypes::DataType::Float64)
     /// and [`DataType::Float32`](polars_core::datatypes::DataType::Float32).
     pub float_precision: Option<usize>,
+    /// Used for [`DataType::Float64`] and [`DataType::Float32`].
+    pub float_scientific: Option<SciNotationOptions>,
     /// Used as separator.
     pub separator: u8,
     /// Quoting character.
@@ -60,6 +82,7 @@ impl Default for SerializeOptions {
             time_format: None,
             datetime_format: None,
             float_precision: None,
+            float_scientific: None,
             separator: b',',
             quote_char: b'"',
             null: String::new(),
